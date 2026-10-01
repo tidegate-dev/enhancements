@@ -1,0 +1,36 @@
+name: TEP tracking issue
+description: Propose a significant change to Tidegate and track its TEP.
+title: "TEP: "
+labels: ["tep"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this issue to describe the problem and gather early feedback before writing a full TEP.
+        See [TEP-0001](https://github.com/tidegate-dev/enhancements/blob/main/teps/0001-tep-process/README.md) for the process.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve, and for whom?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed direction
+      description: A rough outline of the change. Details belong in the TEP.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Does this touch authentication, authorization, credentials, audit logging, or trust boundaries? A short first assessment is enough.
+    validations:
+      required: true
+  - type: input
+    id: tep-pr
+    attributes:
+      label: TEP pull request
+      description: Link the pull request once the TEP is written.
