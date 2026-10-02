@@ -50,6 +50,10 @@ Run `scripts/validate-teps.py` locally before pushing. CI runs the same checks.
 | [0001](teps/0001-tep-process/README.md) | TEP process | implemented | @trevex |
 <!-- END TEP INDEX -->
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request titles and how to sign off commits. Please follow our [Code of Conduct](CODE_OF_CONDUCT.md) in all project spaces.
+
 ## License
 
 All TEPs are licensed under the [Apache License 2.0](LICENSE), the same license as Tidegate.
