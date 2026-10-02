@@ -12,3 +12,4 @@ Status change: <!-- e.g. draft -> provisional -->
 - [ ] The security considerations section has content appropriate for the target status.
 - [ ] `scripts/validate-teps.py` passes and the index in `README.md` is up to date.
 - [ ] The implementation history section records this change.
+- [ ] Every commit is signed off (`git commit -s`, see `CONTRIBUTING.md`).
