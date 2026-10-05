@@ -49,6 +49,7 @@ Run `scripts/validate-teps.py` locally before pushing. CI runs the same checks.
 |---|---|---|---|
 | [0001](teps/0001-tep-process/README.md) | TEP process | implemented | @trevex |
 | [0002](teps/0002-architecture/README.md) | Architecture vision | draft | @trevex |
+| [0003](teps/0003-data-model/README.md) | Data and authorization model | draft | @trevex |
 <!-- END TEP INDEX -->
 
 ## Contributing
