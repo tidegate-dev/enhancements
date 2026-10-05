@@ -8,7 +8,7 @@ approvers:
   - "@tidegate-dev/maintainers"
 tracking-issue: null
 created: 2026-10-02
-last-updated: 2026-10-02
+last-updated: 2026-10-05
 replaces: []
 superseded-by: []
 ---
@@ -29,7 +29,7 @@ Every component described in [TEP-0002](../0002-architecture/README.md) depends 
 
 Jumpgate, Tidegate's predecessor, organized assets in a folder tree and let roles cascade down folders through rewrite rules. That model is expressive, but access depends on where an asset sits in the tree and on which rules a role carries, which makes it hard to see why someone has access. The maintainers want a flatter model in which access follows from a short chain of explicit records: a binding, a role, a label selector, and a capability. Labels also suit assets that are discovered or managed by automation, because tooling can set labels without placing assets in a hierarchy.
 
-The model also has to separate administration from access. In a PAM system, the people who manage users and identity providers should not gain shell access to production as a side effect, and the people who own a project should not be able to change organization settings.
+The model also has to separate administration of Tidegate from access through Tidegate. In a PAM system, holding an organization role that manages users or identity providers should not grant shell access to production as a side effect, and owning a project should not allow changing organization settings. This separation covers roles and bindings inside Tidegate. Groups mapped to an identity provider extend trust to whoever manages group membership at that provider, as described under [Groups](#groups) and [Security considerations](#security-considerations).
 
 ### Goals
 
@@ -142,6 +142,8 @@ By default a group is visible only within its project. A group marked as shared 
 Sharing lets an organization define a group such as `security-team` once, in a project that owns it, and reuse it everywhere. Only the owning project can change a shared group's membership, so other projects reference it but cannot alter it.
 
 A group can also carry an external reference to a group at an identity provider. A user who signs in through that IdP and presents the referenced group in their group claim becomes a member of the Tidegate group for as long as the claim says so. Tidegate never maps IdP groups implicitly: an IdP group named `admins` has no effect until some Tidegate group references it by provider and value. An external reference names the IdP as well as the group value, so a group claim from one provider cannot satisfy a reference meant for another.
+
+An external reference makes the IdP's group administrators part of the Tidegate group's trust: whoever can add a user to the IdP group grants that user the Tidegate group's access, including themselves. For this reason mapping is opt-in per group, and a project can keep its sensitive groups limited to explicitly listed members.
 
 A group can combine an external reference with explicitly listed members. Membership is then the union of both.
 
@@ -331,7 +333,7 @@ Organization-level resources have names unique within the organization for their
 
 ## Security considerations
 
-- Trust boundaries. Identity providers are trusted to authenticate users and to assert group claims, but only for the groups that Tidegate explicitly maps, and only for the provider each mapping names. Projects form an administrative boundary: a project's administrators can affect other projects only through groups they share.
+- Trust boundaries. Identity providers are trusted to authenticate users and to assert group claims, but only for the groups that Tidegate explicitly maps, and only for the provider each mapping names. Using an IdP for sign-in already places it inside the trust boundary, because an IdP administrator who can sign in as a user holds that user's access in Tidegate. Multi-factor authentication with a factor only the user holds, such as a hardware key, prevents this kind of impersonation. It does not prevent an IdP administrator from adding their own account to a mapped IdP group and so granting themselves access. Group mapping is opt-in per group for this reason. Projects form an administrative boundary: a project's administrators can affect other projects only through groups they share.
 - Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. It does allow changing the IdP configuration or group mappings, which can lead to access indirectly, so organization roles must be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting capabilities they do not hold.
 - Credentials and secrets. This model stores local password hashes for break-glass users and IdP client secrets. Both are stored encrypted or hashed and never returned through the API. Bootstrap configuration must not contain plaintext passwords; how the first break-glass password is delivered is an open question.
 - Audit. Every create, update, and delete of a resource in this model is audited, along with access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, and capability that allowed it.
@@ -378,6 +380,7 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 ## Unresolved questions
 
 - What should the "shared" flag be called? Meetings used both "shared" and "exported", and an early bootstrap draft used `extern`. This TEP uses `shared`.
+- Should OrgRole and Role, and OrgBinding and Binding, be merged into one Role and one Binding kind, where omitting `project` makes the resource organization-scoped? Organization-scoped roles would still accept only governance capabilities and no selector, so the separation between administration and asset access stays, with fewer resource kinds to learn. This mirrors Kubernetes, where ClusterRole and Role share one schema.
 - Can org bindings be requested through access policies, so that organization administration is also just-in-time? This TEP allows org bindings with an expiry time but defines access policies only for project roles.
 - Do local-login accounts require a second factor, such as TOTP or WebAuthn, and how is the first password delivered without putting it in the bootstrap file?
 - Does creating a project automatically bind its creator to a project administrator role, and should Tidegate ship built-in project roles?
