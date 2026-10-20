@@ -69,7 +69,7 @@ An admission ticket is not proof that a session may continue. The worker re-chec
 
 Every gateway and worker implementation follows these rules:
 
-1. A client chooses only an asset and an operation allowed by its authorization. It never supplies a network address for the target or worker.
+1. A client chooses only an asset and an operation allowed by its authorization. It never supplies a real network address for the target or worker.
 2. A ticket starts at most one live session. The control plane records consumption durably, including after the session ends, until replay is no longer possible.
 3. A gateway may reject a connection, route it, and enforce connection limits. It cannot issue a target credential.
 4. A worker accepts a session only through its mutually authenticated control-plane identity. The control plane binds the session to that worker before returning target information.
