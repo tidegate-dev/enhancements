@@ -21,7 +21,7 @@ This TEP defines how Tidegate turns an authorized access decision into a proxied
 
 TEP-0002 calls the HTTPS entry point the `web-gateway`. This TEP proposes the name `session-gateway` instead. The component is not specific to web traffic: it is the common ingress, worker selector, and byte-stream router for browser sessions, CLI tunnels, and protocol gateways. The rest of this TEP uses `session-gateway`.
 
-The same lifecycle serves every public entry point. The session-gateway validates an admission ticket, selects a compatible worker, and relays the enclosed stream without parsing its target protocol. Browser and CLI clients connect to it directly. Protocol gateways authenticate native clients and open the same ticketed tunnel on their behalf.
+The same lifecycle serves every public entry point. The session-gateway performs a preliminary ticket check, selects a compatible worker, and relays the enclosed stream without parsing its target protocol. This check rejects malformed, expired, or misrouted requests early, but it does not admit the session. Admission becomes authoritative only when the selected worker redeems the ticket with the control plane, which detects replay and authorization changes and binds the session to that worker. Browser and CLI clients connect to the session-gateway directly. Protocol gateways authenticate native clients and open the same ticketed tunnel on their behalf.
 
 Native SSH uses two nested client connections. The outer SSH connection authenticates a registered user key to the ssh-gateway. A restricted `direct-tcpip` channel then carries an inner SSH connection through the session-gateway to an SSH worker. The ticket is bound to the registered key, and the worker verifies a fresh signature from the same key on the inner connection. The worker opens a separate SSH connection to the target with a session credential. The user's key never reaches the target, and the target credential never reaches either public gateway.
 
@@ -67,10 +67,10 @@ An admission ticket is not proof that a session may continue. The worker re-chec
 
 ### Security invariants
 
-Every gateway and worker implementation follows these rules:
+Every component fails closed. Missing, stale, ambiguous, inconsistent, unverifiable, or unavailable state required for a security decision causes the operation to be refused or the session to be terminated. It never triggers a fallback that skips or weakens a check. Gateways and workers also follow these rules:
 
 1. A client chooses only an asset and an operation allowed by its authorization. It never supplies a real network address for the target or worker.
-2. A ticket starts at most one live session. The control plane records consumption durably, including after the session ends, until replay is no longer possible.
+2. A ticket can be redeemed at most once and starts at most one live session. The control plane records consumption durably before returning target details. Once recorded, consumption is irreversible even if worker preparation, recording setup, the target connection, target authentication, or session activation later fails. A retry requires a new ticket.
 3. A gateway may reject a connection, route it, and enforce connection limits. It cannot issue a target credential.
 4. A worker accepts a session only through its mutually authenticated control-plane identity. The control plane binds the session to that worker before returning target information.
 5. A proof-of-possession ticket is accepted only after the worker verifies the client key named by its confirmation claim. Authentication at an edge gateway does not replace this check.
@@ -116,7 +116,7 @@ flowchart LR
     worker -->|"recording"| store
 ```
 
-The session-gateway is an authenticated session router. It terminates TLS and HTTP, validates enough of the ticket to reject malformed or expired connections, selects a worker, and relays bytes or WebSocket frames. It does not parse the protocol inside a tunnel. The CLI and ssh-gateway use the same HTTPS `CONNECT` contract. For native SSH, the tunnel payload is the opaque inner SSH byte stream, so worker selection and ticket forwarding have one implementation.
+The session-gateway is a ticket-aware session router, not an authorization authority. It terminates TLS and HTTP, validates enough of the ticket to reject malformed or expired connections, selects a worker, and relays bytes or WebSocket frames. It does not parse the protocol inside a tunnel. The CLI and ssh-gateway use the same HTTPS `CONNECT` contract. For native SSH, the tunnel payload is the opaque inner SSH byte stream, so worker selection and ticket forwarding have one implementation.
 
 The session-gateway keeps an authenticated control stream to the control plane. It receives ticket verification keys, worker availability and capacity, and termination notices for sessions it currently carries. It maps each admitted session ID to its local client and worker connections so it can close both promptly. This is routing and connection state, not an authorization cache or the authoritative session record.
 
@@ -162,7 +162,7 @@ stateDiagram-v2
     Ended --> [*]
 ```
 
-Transitions use compare-and-set semantics in the same transaction as their audit event. Redeeming a ticket changes `issued` to `preparing` and records the worker identity. A concurrent or later redemption fails. Terminal records remain until the admission ticket has expired and the audit retention policy permits cleanup.
+Transitions use compare-and-set semantics in the same transaction as their audit event. Redeeming a ticket changes `issued` to `preparing` and records the worker identity. A concurrent or later redemption fails. No failure moves a session back to `issued`; the client must obtain a new ticket. Terminal records remain until the admission ticket has expired and the audit retention policy permits cleanup.
 
 The session record contains at least:
 
@@ -458,6 +458,7 @@ Integration tests cover:
 - Shell, exec, PTY resize, and `rsync` behavior, plus SFTP and legacy SCP when those features are advertised.
 - Rejection of TCP, agent, X11, and unapproved environment forwarding.
 - Ticket replay before, during, and after an active session.
+- Ticket replay after preparation, recording setup, target connection, target authentication, or activation fails.
 - Grant revocation, expiry, user deactivation, gateway loss, worker loss, and control-stream loss.
 - Independent teardown at the session-gateway and worker, including a session-gateway that misses or ignores its termination notice.
 - Worker roster and capacity changes affecting new routing decisions without moving live sessions.
