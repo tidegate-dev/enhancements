@@ -176,7 +176,7 @@ The session record contains at least:
 - Creation, activation, termination-request, and end times.
 - A stable end reason.
 
-The record does not contain a plaintext ticket or target credential. Stored ticket identifiers use a cryptographic hash when the ticket itself is opaque.
+The record does not contain a plaintext ticket or target credential. Stored ticket identifiers use a modern and secure cryptographic hash when the ticket itself is opaque.
 
 ### Admission tickets
 
