@@ -79,7 +79,7 @@ Every gateway and worker implementation follows these rules:
 8. The session credential is bound to the authorized asset, login, session, and worker where the credential system supports those constraints. It expires no later than the authorization.
 9. Required recording starts before the target is authenticated. A recording failure refuses or ends the session.
 10. Revocation, lease expiry, user deactivation, worker loss, and authorization expiry all end the session.
-11. Tickets, target credentials, private keys, and recording contents are excluded from logs.
+11. Tickets, target credentials, private keys, other secrets, and recording contents are excluded from logs.
 
 ### Components and responsibilities
 
