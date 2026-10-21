@@ -16,6 +16,8 @@ To propose a new TEP, open an issue using the "TEP tracking issue" template firs
 4. A maintainer reviews the pull request and may ask for changes.
 5. Once it is approved, a maintainer squash merges it.
 
+Every pull request needs one approval from a maintainer other than its author before it can be merged. If someone pushes to the pull request after the approval, it needs a new approval from someone other than that person. A TEP needs more approvals before its status changes, as [TEP-0001](teps/0001-tep-process/README.md#approval) explains.
+
 ## Pull request titles
 
 Pull requests are squash merged, so the pull request title becomes the commit message on `main`. Titles must follow [Conventional Commits](https://www.conventionalcommits.org/):
