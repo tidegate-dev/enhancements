@@ -8,7 +8,7 @@ approvers:
   - "@tidegate-dev/maintainers"
 tracking-issue: null
 created: 2026-10-19
-last-updated: 2026-10-19
+last-updated: 2026-10-23
 replaces: []
 superseded-by: []
 ---
@@ -17,69 +17,81 @@ superseded-by: []
 
 ## Summary
 
-This TEP defines how Tidegate turns an authorized access decision into a proxied session. The control plane creates a short-lived, single-use admission ticket. The session-gateway accepts the tunnel and chooses a compatible worker. The worker redeems the ticket, verifies the target, obtains a session credential, records the traffic, and proxies the connection. The control plane keeps the session lease and can revoke it at any time.
+This TEP defines how Tidegate turns an authenticated client request into a proxied session. An ingress gateway collects or verifies the client's authentication material and asks the authority to create a session for an exact asset, protocol, action, and qualifier such as an SSH login. The authority derives the user, checks current authorization, and returns a short-lived, single-use admission ticket. The session-gateway selects a compatible worker, and the worker redeems the ticket before it receives target details or a target credential.
 
-TEP-0002 calls the HTTPS entry point the `web-gateway`. This TEP proposes the name `session-gateway` instead. The component is not specific to web traffic: it is the common ingress, worker selector, and byte-stream router for browser sessions, CLI tunnels, and protocol gateways. The rest of this TEP uses `session-gateway`.
+TEP-0002 names the central decision-making component the `authority`; this TEP uses that name throughout. TEP-0002 calls the HTTPS entry point the `web-gateway`. This TEP proposes `session-gateway` because the component routes browser sessions, CLI tunnels, and tunnels opened by protocol gateways.
 
-The same lifecycle serves every public entry point. The session-gateway performs a preliminary ticket check, selects a compatible worker, and relays the enclosed stream without parsing its target protocol. This check rejects malformed, expired, or misrouted requests early, but it does not admit the session. Admission becomes authoritative only when the selected worker redeems the ticket with the control plane, which detects replay and authorization changes and binds the session to that worker. Browser and CLI clients connect to the session-gateway directly. Protocol gateways authenticate native clients and open the same ticketed tunnel on their behalf.
+All ingress paths use the same authority and worker lifecycle:
 
-Native SSH uses two nested client connections. The outer SSH connection authenticates a registered user key to the ssh-gateway. A restricted `direct-tcpip` channel then carries an inner SSH connection through the session-gateway to an SSH worker. The ticket is bound to the registered key, and the worker verifies a fresh signature from the same key on the inner connection. The worker opens a separate SSH connection to the target with a session credential. The user's key never reaches the target, and the target credential never reaches either public gateway.
+- A CLI opens HTTPS `CONNECT` to the session-gateway with its user credential, requested scope, and an ephemeral client key.
+- A browser authenticates to the session-gateway with its session cookie and opens a WebSocket after session creation.
+- A native SSH client opens one SSH connection to the ssh-gateway. The ssh-gateway terminates SSH, verifies the user's public-key signature, and asks the authority to create the session for that public key and the requested scope.
+
+The ssh-gateway is trusted to report successful client authentication. The authority derives the user from the complete public key or user certificate, so the gateway cannot choose a subject independently of that authentication material. Public keys are not secret, so possession remains an assertion made by the trusted ssh-gateway in the initial API. The gateway translates the client SSH connection into a framed session stream for the SSH worker. The session-gateway routes that stream without interpreting SSH channel semantics. The worker alone connects to the target, verifies its identity, obtains the target credential, records the session, and enforces the session lease.
 
 ## Motivation
 
-[TEP-0002](../0002-architecture/README.md) defines the control plane, gateways, and workers. It leaves several details open: what a session ticket contains, how replay is prevented, when a worker becomes responsible for a session, how target credentials are released, and how an SSH connection moves from a protocol gateway to an SSH worker. This TEP is the reference for those details when its flow differs from the illustrative flow in TEP-0002.
+[TEP-0002](../0002-architecture/README.md) defines the authority, gateways, and workers at a high level. It leaves several session details open: how a gateway proves who it authenticated, what a session-creation request may contain, how replay is prevented, when a worker owns a session, and when a target credential may be released.
 
-These details form one security boundary. A ticket that can be replayed can create a second session after a grant is revoked. A worker that receives a credential before it authenticates the target can send that credential to an impostor. A native SSH gateway that blindly asserts a user to the control plane can impersonate every user if it is compromised. A complete flow must close each of those gaps and define failure behavior across component restarts and network partitions.
+Native SSH also needs a clear trust decision. A nested SSH design can keep session contents and user authentication opaque to the ssh-gateway, but it requires two SSH handshakes, generated jump-host configuration, and an SSH server in the worker. This proposal trusts the ssh-gateway as the client-facing SSH endpoint. Users make one ordinary SSH connection, while the worker and authority retain control over authorization, target identity, credentials, recording, and revocation.
 
 ### Goals
 
 - Define one session lifecycle for browser, CLI, and native protocol clients.
-- Keep authorization in the control plane and target credentials in protocol workers.
-- Make admission tickets short-lived, single-use, audience-bound, and safe to route through a gateway.
+- Define an authenticated gRPC API through which gateways request narrowly scoped sessions from the authority.
+- Derive the user from authentication material instead of accepting a user identifier asserted by a gateway.
+- Keep authorization and session state in the authority.
+- Keep target credentials in protocol workers.
+- Make admission tickets short-lived, single-use, audience-bound, and safe to pass through gateways.
 - Verify target identity before releasing a target credential.
-- Support prompt revocation and a bounded fail-closed path when the control plane is unavailable.
-- Show the complete session-gateway and ssh-gateway flows, including the nested SSH connection used by native clients.
-- Record enough state and audit data to explain who connected, to which target and login, under which authorization, and how the session ended.
+- Support prompt revocation and bounded fail-closed behavior when a required dependency is unavailable.
+- Record enough state to explain who connected, which authentication method was used, what was authorized, which components carried the session, and why the session ended.
 
 ### Non-goals
 
 - Defining the role, binding, and access-request model. [TEP-0003](../0003-data-model/README.md) defines those resources.
-- Choosing a token encoding, RPC framework, SSH library, or recording file format.
-- Defining the exact SSH username syntax used to name a Tidegate user, asset, and target login.
-- Designing protocol gateways other than SSH. They follow the lifecycle in this TEP but need their own authentication and protocol design.
-- Allowing arbitrary TCP forwarding through Tidegate. Each protocol worker connects only to the endpoint of the authorized asset.
+- Defining protobuf messages, package names, or the worker stream framing. A later API TEP specifies those wire formats.
+- Choosing an SSH library or recording container.
+- Defining the exact SSH username syntax used to name an asset and target login.
+- Designing protocol gateways other than SSH. They use the lifecycle in this TEP but need protocol-specific authentication and translation rules.
+- Allowing arbitrary TCP forwarding through Tidegate. A worker connects only to the endpoint of the authorized asset.
+- Protecting a user from a compromised public gateway. Public gateways are trusted authenticators in this proposal.
 - Defining high-availability or multi-region deployment topology.
 
 ## Proposal
 
 ### Terms
 
-The session flow uses four related objects:
+The session flow uses these objects:
 
 | Object | Purpose | Lifetime |
 |---|---|---|
+| Authority | The trusted service that authenticates session-creation calls, decides authorization, owns session state, and issues admission tickets and target credentials. | Deployment lifetime. |
 | Authorization | A binding or grant that permits a user to perform an action on an asset, such as SSH login as `deploy`. | Set by policy or an approved access request. |
-| Admission ticket | A signed capability to start one specific session. It names the user, asset, protocol, client binding, and expiry. It also names the requested qualifier when the ingress knows it. | Long enough to establish one connection. |
-| Live session | The control-plane record for an admitted connection, owned by one worker. | From ticket redemption through teardown. |
+| Authentication context | The credential or gateway assertion from which the authority derives the user, such as a CLI bearer token, browser session credential, or registered SSH public key. | One session-creation call. |
+| Admission ticket | A signed capability to prepare one specific session. It names the authorized scope, route, ingress, and expiry. | Long enough to connect one worker. |
+| Live session | The authority's record for an admitted connection, owned by one worker after ticket redemption. | From creation through teardown. |
 | Session credential | The credential the worker uses for the target connection. | No longer than the live session and its authorization. |
 
-An admission ticket is not proof that a session may continue. The worker re-checks authorization when it redeems the ticket, and the control plane renews the live session through a short lease.
+An admission ticket allows a worker to ask the authority to prepare a session. It does not prove that the session may continue. The authority re-checks authorization when the worker redeems the ticket and renews the active session through a short lease.
 
 ### Security invariants
 
-Every component fails closed. Missing, stale, ambiguous, inconsistent, unverifiable, or unavailable state required for a security decision causes the operation to be refused or the session to be terminated. It never triggers a fallback that skips or weakens a check. Gateways and workers also follow these rules:
+Every component fails closed. Missing, stale, ambiguous, inconsistent, unverifiable, or unavailable state required for a security decision causes the operation to be refused or the session to be terminated. It never causes a fallback that skips or weakens a check.
 
-1. A client chooses only an asset and an operation allowed by its authorization. It never supplies a real network address for the target or worker.
-2. A ticket can be redeemed at most once and starts at most one live session. The control plane records consumption durably before returning target details. Once recorded, consumption is irreversible even if worker preparation, recording setup, the target connection, target authentication, or session activation later fails. A retry requires a new ticket.
-3. A gateway may reject a connection, route it, and enforce connection limits. It cannot issue a target credential.
-4. A worker accepts a session only through its mutually authenticated control-plane identity. The control plane binds the session to that worker before returning target information.
-5. A proof-of-possession ticket is accepted only after the worker verifies the client key named by its confirmation claim. Authentication at an edge gateway does not replace this check.
-6. The worker receives the target endpoint and trust anchors from the control plane. It does not accept either from the client or gateway.
-7. Target identity is verified before any target credential is released.
-8. The session credential is bound to the authorized asset, login, session, and worker where the credential system supports those constraints. It expires no later than the authorization.
-9. Required recording starts before the target is authenticated. A recording failure refuses or ends the session.
-10. Revocation, lease expiry, user deactivation, worker loss, and authorization expiry all end the session.
-11. Tickets, target credentials, private keys, other secrets, and recording contents are excluded from logs.
+1. A client chooses a logical asset and operation. It never supplies a real network address for a target or worker.
+2. A session-creation request contains the exact protocol, action, and qualifier being requested. The authority resolves the user from authentication material and ignores or rejects a caller-supplied subject.
+3. The authority accepts each session-creation method only from its permitted gateway workload identities over mutual TLS.
+4. An ssh-gateway request contains the complete SSH public key or user certificate. A key must resolve to exactly one active registered owner. For a user certificate, the authority validates the issuer, validity, and principal before deriving the user. A fingerprint or user ID supplied by the gateway is not authoritative.
+5. A ticket can be redeemed at most once and starts at most one live session. Consumption is recorded durably before the authority returns target details. Once recorded, consumption is irreversible even if later setup fails. A retry requires a new ticket.
+6. A gateway may authenticate a client, request a session, reject a connection, route it, translate its client protocol, and enforce limits. It cannot obtain or issue a target credential.
+7. A worker accepts a session only through the internal data plane. The authority binds the session to the worker's authenticated workload identity before returning target details.
+8. The worker receives the target endpoint and trust anchors from the authority. It accepts neither from a client nor a gateway.
+9. The worker verifies target identity before the authority releases a target credential.
+10. The session credential is bound to the authorized asset, login, session, and worker where the credential system supports those constraints. It expires no later than the authorization.
+11. Required recording starts before target authentication. A recording failure refuses or ends the session.
+12. Revocation, lease expiry, user deactivation, worker loss, and authorization expiry end the session.
+13. Tickets, user credentials, target credentials, private keys, other secrets, and recording contents are excluded from logs.
 
 ### Components and responsibilities
 
@@ -91,7 +103,7 @@ flowchart LR
         ssh["Native SSH client"]
     end
 
-    subgraph edge["Exposed edge"]
+    subgraph edge["Trusted public gateways"]
         sessiongw["session-gateway"]
         sshgw["ssh-gateway"]
     end
@@ -100,55 +112,58 @@ flowchart LR
         worker["SSH worker"]
     end
 
-    cp["Control plane"]
+    auth["Authority"]
     target["SSH target"]
     store["Recording store"]
 
-    cli -->|"HTTPS CONNECT + ticket"| sessiongw
-    browser -->|"WSS + session cookie"| sessiongw
-    ssh -->|"outer SSH"| sshgw
+    cli -->|"HTTPS CONNECT<br/>user bearer + scope"| sessiongw
+    browser -->|"HTTPS + WSS<br/>session cookie + scope"| sessiongw
+    ssh -->|"SSH"| sshgw
+    sessiongw -->|"CreateUserSession gRPC"| auth
+    sshgw -->|"CreateSSHSession gRPC<br/>public key + scope"| auth
+    sshgw -->|"mTLS HTTPS CONNECT<br/>ticket + session stream"| sessiongw
     sessiongw -->|"mTLS session tunnel"| worker
-    sshgw -->|"HTTPS CONNECT + ticket"| sessiongw
-    sessiongw <-->|"worker roster · keys · teardown"| cp
-    sshgw -->|"native admission"| cp
-    worker -->|"prepare, issue, lease"| cp
+    sessiongw <-->|"worker roster · keys · teardown"| auth
+    worker <-->|"prepare · issue · lease"| auth
     worker -->|"verified SSH connection"| target
     worker -->|"recording"| store
 ```
 
-The session-gateway is a ticket-aware session router, not an authorization authority. It terminates TLS and HTTP, validates enough of the ticket to reject malformed or expired connections, selects a worker, and relays bytes or WebSocket frames. It does not parse the protocol inside a tunnel. The CLI and ssh-gateway use the same HTTPS `CONNECT` contract. For native SSH, the tunnel payload is the opaque inner SSH byte stream, so worker selection and ticket forwarding have one implementation.
+The authority is the only component that decides whether a session may be created or continued. It owns identities, registered SSH keys, authorization, the asset catalog, live session state, ticket signing keys, trust anchors, credential providers, and the audit log.
 
-The session-gateway keeps an authenticated control stream to the control plane. It receives ticket verification keys, worker availability and capacity, and termination notices for sessions it currently carries. It maps each admitted session ID to its local client and worker connections so it can close both promptly. This is routing and connection state, not an authorization cache or the authoritative session record.
+The session-gateway is a ticket-aware session router. It terminates public HTTPS and WebSocket connections, requests sessions for authenticated CLI and browser users, performs preliminary ticket checks, selects workers, and relays session streams. It also accepts mutually authenticated tunnels from protocol gateways. Its local ticket check rejects malformed, expired, or misrouted requests early. Authoritative admission happens when the worker redeems the ticket with the authority.
 
-The ssh-gateway is a restricted SSH jump server at the edge. It presents Tidegate's host identity, authenticates a registered user key, reads the requested asset from the outer SSH user name, and asks the control plane for a ticket bound to that key. It accepts only a controlled `direct-tcpip` channel for the selected asset. The bytes inside that channel remain an end-to-end SSH connection between the client and worker.
+The ssh-gateway is the SSH server seen by native clients. It presents Tidegate's public SSH host identity, parses the logical asset and target login, verifies client public-key authentication, and requests the corresponding session from the authority. It translates allowed SSH connection-protocol messages into the framed session stream consumed by the SSH worker. The ssh-gateway sees commands, file-transfer data, and output for native SSH sessions.
 
-The SSH worker terminates the inner SSH connection and owns the target side. It verifies that the inner client proves possession of the key named by the ticket, redeems the ticket, opens the recorder, verifies the target host identity, obtains the target credential, and proxies SSH channels to the target. The worker holds the target credential only while it owns the session.
+The SSH worker owns the target side. It redeems the ticket, opens the recorder, verifies the target host identity, obtains a session credential, connects to the target, and maps the admitted session stream to target SSH channels. It holds the target credential only while it owns the session.
 
 ### User stories
 
-- A user selects an SSH asset in the web UI and opens a terminal. The browser connects to the session-gateway with a one-use ticket. The SSH worker verifies the host and opens a recorded shell as an authorized login.
-- A user runs `tidegate connect deploy@web-01`. The CLI creates an ephemeral client key, binds the admission ticket to that key, and carries an SSH connection through the session-gateway. The SSH worker requires proof of the ephemeral private key before it prepares the target session.
-- A user registers an SSH public key with Tidegate and connects with OpenSSH configuration supplied by Tidegate. OpenSSH authenticates an outer connection to the ssh-gateway and starts an inner connection to the worker through it. The same private key signs both handshakes.
-- An approver revokes a grant while a shell is open. The control plane marks the session terminating, tells the session-gateway and worker to close it, and records the forced teardown in the audit log.
-- A target presents a host key that is not approved for the asset. The worker stops before credential issuance and records a target-identity failure.
+- A CLI user runs `tidegate connect deploy@web-01`. The CLI opens HTTPS `CONNECT` with its bearer credential and an ephemeral SSH public key. The session-gateway asks the authority for the session, then carries the CLI's SSH connection to the worker.
+- A user starts a terminal in the web UI. The session-gateway uses the browser session credential to request the exact asset and login, then relays the WebSocket session to the worker.
+- A user runs a normal OpenSSH command against the Tidegate SSH endpoint. The ssh-gateway verifies the key signature, the authority resolves its registered owner and authorization, and Tidegate proxies the resulting SSH channels through the session-gateway and worker.
+- An approver revokes a grant while a shell is open. The authority tells the session-gateway and worker to close the session. Lease expiry covers a missed notification.
+- A target presents an unapproved host key. The worker stops before credential issuance and records a target-identity failure.
 
 ### Risks and mitigations
 
-- A stolen bearer ticket could be used before it expires. CLI tickets are bound to an ephemeral client key. Native SSH tickets are bound to the registered key authenticated on the outer connection. Browser tickets have a short lifetime, are single-use, and are accepted only from configured origins.
-- A compromised ssh-gateway can request tickets and disrupt connections, but it cannot complete inner SSH authentication without the user's private key. Inner SSH encryption also prevents it from reading or changing session contents. A compromised session-gateway has the same limits for CLI and native SSH tunnels. Browser terminal traffic remains visible to the session-gateway because the browser session terminates there.
-- A compromised worker can read a session and misuse its current target credential. Session-scoped credentials, narrow target principals, short expiry, and revocation limit the exposure. Stored target passwords and private keys cannot receive all of these limits and are a compatibility exception.
-- Worker selection can race with a stale roster. The selected worker must redeem the ticket under its own mesh identity. A missing or ineligible worker fails before credential issuance, and the session-gateway may choose another worker only while the ticket remains unconsumed.
-- A parser flaw in a public protocol gateway is reachable before authentication. Protocol gateways run separately, enforce handshake timeouts and message limits, and have no control-plane database or target-secret access.
+- A compromised ssh-gateway can request a session for any registered public key it knows. Public keys are not secrets, so requiring a key in the gRPC request limits the request to a real user and current authorization but does not prove that the user participated. Mutual TLS, method-level workload authorization, exact scope checks, rate limits, and audit reduce exposure. The future proof described below can require a fresh user signature.
+- A compromised session-gateway can use a CLI bearer token or browser session credential that passes through it while that credential remains valid. User credentials should have a narrow audience and short lifetime. The authority still enforces current authorization and session limits.
+- A stolen native admission ticket is usable only through the session-gateway endpoint, before expiry and redemption, from the gateway workload identity named by the ticket. The gateway-to-gateway `CONNECT` endpoint requires mutual TLS.
+- A compromised public gateway can read or alter sessions that terminate there. It still cannot obtain a target credential or choose a target address. The worker receives both from the authority and verifies target identity first.
+- A compromised worker can read its sessions and misuse a current target credential. Session-scoped credentials, narrow target principals, short expiry, and revocation limit the exposure. Stored passwords and private keys are a weaker compatibility mode.
+- A parser flaw in a public protocol gateway is reachable before user authentication. Protocol gateways run separately, limit handshake work and authentication attempts, and have no authority database or target-secret access.
+- Worker selection can race with a stale roster. A worker must redeem the ticket under its own workload identity. Another worker may be selected only while the ticket remains unconsumed.
 
 ## Design details
 
 ### Session state machine
 
-The control plane persists a session record before returning an admission ticket. The record is the replay guard and the source of truth for teardown.
+The authority persists a session record before returning an admission ticket. The record is the replay guard and the source of truth for teardown.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Issued: ticket minted
+    [*] --> Issued: authority creates session
     Issued --> Preparing: worker redeems ticket
     Issued --> Expired: ticket expires unused
     Preparing --> Active: target authenticated and recording ready
@@ -162,187 +177,205 @@ stateDiagram-v2
     Ended --> [*]
 ```
 
-Transitions use compare-and-set semantics in the same transaction as their audit event. Redeeming a ticket changes `issued` to `preparing` and records the worker identity. A concurrent or later redemption fails. No failure moves a session back to `issued`; the client must obtain a new ticket. Terminal records remain until the admission ticket has expired and the audit retention policy permits cleanup.
+Transitions use compare-and-set semantics in the same transaction as their audit event. Redeeming a ticket changes `issued` to `preparing` and records the worker identity. A concurrent or later redemption fails. No failure moves a session back to `issued`; the client must start a new session. Terminal records remain until replay is no longer possible and the audit retention policy permits cleanup.
 
 The session record contains at least:
 
-- Session ID and current state.
-- User, asset, protocol, requested action, and qualifier such as the SSH login.
+- Session ID and state.
+- User, authentication method, gateway instance, and gateway connection identifier.
+- Asset, protocol, action, and qualifier such as the SSH login.
 - The binding or grant that authorized the session, when one can be identified.
 - Ticket issue and expiry times.
-- Owning gateway and worker identities.
+- Owning session-gateway and worker identities.
 - Target endpoint revision and matched trust-anchor identifier.
-- Recording policy, recording object identifier, and final digest.
+- Recording policy, object identifier, status, and final digest.
 - Creation, activation, termination-request, and end times.
 - A stable end reason.
 
-The record does not contain a plaintext ticket or target credential. Stored ticket identifiers use a modern and secure cryptographic hash when the ticket itself is opaque.
+The record contains no plaintext ticket, user credential, target credential, or private key. Stored ticket identifiers use a modern, secure cryptographic hash when the ticket is opaque.
+
+### Authority gRPC API
+
+Gateways and workers call the authority through gRPC over mutual TLS. The client certificate identifies the workload and instance. Method-level authorization prevents one gateway type from using another gateway's session-creation method and prevents any gateway from calling worker-only credential methods.
+
+`CreateUserSession` serves CLI and browser ingress through the session-gateway. The request names the asset, protocol, action, qualifier, stream kind, and optional client proof-of-possession key. The original user credential is forwarded as per-call gRPC credentials or equivalent protected metadata. The authority validates that credential and derives the user from it. The request has no authoritative `subject` field.
+
+`CreateSSHSession` serves native SSH ingress. Its request contains:
+
+- The complete SSH public key blob or SSH user certificate presented by the client.
+- The logical asset selector, protocol, `login` action, and exact target login parsed from the SSH user name.
+- A unique gateway connection identifier used as an idempotency key.
+- The authenticated ssh-gateway instance from mutual TLS, supplied by the transport rather than the protobuf message.
+
+The authority parses and canonicalizes a public key, computes its fingerprint with an approved SSH fingerprint algorithm, and requires exactly one active user registration. For a Tidegate SSH user certificate, it validates the certificate authority, validity interval, critical options, and user principal before deriving the user. It then checks current authorization for the exact asset and login. It neither accepts a user ID from the gateway nor treats a gateway-computed fingerprint as proof of identity.
+
+An unsigned SSH public-key query does not call `CreateSSHSession`. The ssh-gateway first verifies the signed authentication request. It sends SSH authentication success only after the authority creates the session. Retries with the same gateway instance and connection identifier return the same result, so an uncertain gRPC response cannot create several sessions.
+
+Each session-creation response contains a one-use admission ticket and the session-gateway endpoint. Tickets created for protocol gateways name the exact ingress workload identity. The session-gateway accepts them only on its mutual TLS endpoint from that identity.
 
 ### Admission tickets
 
-The ticket has a narrow audience and carries only routing and authorization context. Its logical claims are:
+An admission ticket carries routing and authorization context:
 
 | Claim | Meaning |
 |---|---|
 | `session_id` | Unique identifier and replay key. |
-| `subject` | Tidegate user identifier. |
+| `subject` | User identifier derived by the authority. |
 | `asset` | Immutable asset identifier. |
 | `protocol` | Worker protocol, such as `ssh`. |
-| `action` and `qualifier` | Authorized operation, such as `login` and `deploy`. The qualifier may be deferred to worker preparation when an encrypted inner protocol supplies it. |
-| `mode` | CLI tunnel, browser, or native protocol gateway. |
-| `route` | Control-plane-selected worker pool or reachability class. |
-| `confirmation` | Optional proof-of-possession binding. CLI SSH uses an ephemeral key fingerprint; native SSH uses the registered key fingerprint from the outer connection. |
+| `action` and `qualifier` | Authorized operation, such as `login` and `deploy`. |
+| `stream_kind` | Worker-facing stream, such as `ssh-wire` or `ssh-events`. |
+| `route` | Authority-selected worker pool or reachability class. |
+| `ingress` | Gateway type and instance that authenticated the client. |
+| `confirmation` | Optional client proof-of-possession binding. CLI SSH uses its ephemeral public-key fingerprint. |
 | `issued_at`, `not_before`, `expires_at` | Ticket validity interval. |
 | `issuer`, `audience`, `key_id` | Signature validation and signing-key rotation. |
 
-The ticket contains no target address, target credential, secret, or policy document. A signed ticket may expose its claims to its holder, so no claim is treated as confidential.
+The ticket contains no target address, target credential, user credential, secret, or policy document. Signed claims are visible to the ticket holder and are not confidential.
 
-Gateways validate the signature, audience, validity interval, mode, and protocol before routing. This check reduces load and rejects obvious misuse. Ticket redemption at the control plane remains authoritative because it detects replay, revocation, state changes, and a worker outside the required route.
+The session-gateway validates the signature, audience, validity interval, ingress binding, protocol, stream kind, and route before selecting a worker. This preliminary check limits load and rejects obvious misuse. Worker redemption at the authority remains authoritative because it detects replay, revocation, authorization changes, and an ineligible worker.
 
-Signing keys rotate through a key identifier. Gateways and workers receive current verification keys over the authenticated control channel and retain an old verification key only while a ticket signed by it can remain valid. An unknown key identifier fails closed.
+Signing keys rotate through `key_id`. Gateways and workers receive current verification keys over authenticated control streams and retain an old verification key only while its tickets can remain valid. An unknown key identifier fails closed.
 
 ### Worker registration and selection
 
-A worker opens a mutually authenticated control stream and registers:
+A worker opens a mutually authenticated gRPC stream to the authority and registers:
 
 - Its workload identity and instance identifier.
-- The protocols and optional feature versions it supports.
-- Its internal data-plane address.
-- Its reachability class or worker pool.
+- Its supported protocols, stream kinds, and feature versions.
+- Its internal data-plane address and reachability class.
 - Its capacity and current live session identifiers.
 
-The control plane publishes an eligible-worker roster, including current capacity, to each session-gateway over its control stream. A session-gateway filters that roster by the signed ticket's protocol and route, excludes unhealthy or full workers, and picks the least-loaded remaining worker with randomized tie-breaking. The chosen address comes from the roster, never from the ticket or client.
+The authority publishes the eligible-worker roster and current capacity to each session-gateway. The gateway filters by the signed protocol, stream kind, and route, excludes unhealthy or full workers, and picks the least-loaded remaining worker with randomized tie-breaking. The worker address comes from the roster, never from a ticket, client, or protocol gateway.
 
-The session-gateway connects to the worker over mutual TLS and verifies the exact workload identity for the roster entry. The worker also verifies that the peer is an allowed gateway type. A DNS name or network location alone is not sufficient identity.
+The session-gateway connects to the selected worker over mutual TLS and verifies the workload identity for the roster entry. The worker verifies the session-gateway identity. A DNS name or network location alone is insufficient.
 
-After accepting a tunnel, the session-gateway reports that it is carrying the session ID and keeps a local mapping to both connections. The control plane sends a termination notice to that gateway when the session is revoked or its owning worker disappears. The gateway then closes the tunnel and reports its removal. These reports are operational routing state only. The control plane remains the source of truth, and the worker independently enforces the same termination through its control stream and lease.
+After accepting a tunnel, the session-gateway reports the session ID and keeps a local mapping to its client-side and worker-side connections. The authority sends termination notices for sessions carried by that gateway. These reports are routing state; the authority's session record remains authoritative, and the worker independently enforces termination and lease expiry.
 
-A connection failure before ticket redemption permits another selection. Once redemption changes the session to `preparing`, another worker cannot claim it. Recovery then requires the control plane to establish that the first worker is gone and move the session to a terminal state. The client starts a new session with a new ticket.
+A connection failure before redemption permits another worker selection. Once redemption changes the session to `preparing`, another worker cannot claim it. Recovery moves the original session to a terminal state, and the client starts a new session.
 
-### Session-gateway flow
+### CLI and browser flow
 
-The session-gateway supports HTTPS `CONNECT` tunnels from the CLI and protocol gateways, and WebSocket sessions from browsers. Both forms use the same worker preparation path.
+The session-gateway creates sessions for both public HTTPS transports. The authority sees the original user credential on each creation call and derives the user itself.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor C as CLI or browser
-    participant CP as Control plane
+    actor C as CLI
     participant GW as session-gateway
+    participant A as Authority
     participant W as SSH worker
     participant T as SSH target
     participant R as Recording store
 
-    C->>CP: Create session for asset and login
-    CP->>CP: Check current authorization and create issued session
-    CP-->>C: One-use admission ticket and gateway endpoint
-    C->>GW: HTTPS CONNECT with bearer ticket, or WSS with cookie
-    GW->>GW: Validate ticket and select eligible worker
-    GW->>W: Open mTLS tunnel and pass ticket
-    W->>CP: Prepare session under worker identity
-    CP->>CP: Consume ticket, re-check authorization, bind worker
-    CP-->>W: Target endpoint, revision, trust anchors, recording policy
+    C->>C: Create ephemeral SSH key
+    C->>GW: HTTPS CONNECT with user bearer, scope, and public key
+    GW->>A: CreateUserSession with credential, scope, and key fingerprint
+    A->>A: Authenticate user and authorize exact request
+    A-->>GW: Admission ticket
+    GW->>GW: Validate ticket and select worker
+    GW->>W: Open mTLS session tunnel and pass ticket
+    C->>W: SSH handshake through opaque CONNECT tunnel
+    W-->>C: Data-plane SSH host certificate
+    C->>W: Ephemeral public key and signature
+    W->>W: Verify ticket confirmation and client signature
+    W->>A: PrepareSession with ticket
+    A->>A: Consume ticket, re-check authorization, bind worker
+    A-->>W: Target endpoint, trust anchors, and recording policy
     W->>R: Start required recording
-    W->>T: Connect and observe host identity without a credential
-    W->>W: Match host identity to an approved anchor
-    W->>CP: Issue credential for session, worker, anchor, and worker key
-    CP->>CP: Re-check session, authorization, route, revision, and anchor
-    CP-->>W: Session credential and lease
-    W->>T: Authenticate target
-    W->>CP: Mark session active
-    W->>T: Open requested SSH channels
+    W->>T: Connect and verify target host identity
+    W->>A: IssueSessionCredential for observed target and worker key
+    A-->>W: Session credential and lease
+    W->>T: Authenticate target and open allowed channels
+    W->>A: ActivateSession
     W-->>C: Proxy recorded session through gateway
 ```
 
-For CLI and protocol-gateway ingress, the client opens an HTTP `CONNECT` request over TLS and presents the admission ticket as a bearer credential in the `Authorization` header. A successful response turns the exchange into a bidirectional byte tunnel as defined by [RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6). The request authority names only the fixed Tidegate session service. It cannot name a target, worker, or arbitrary host and port. The session-gateway rejects any other authority and selects the downstream worker only from signed ticket claims and its control-plane roster. It returns success only after the worker tunnel is ready. This restriction prevents the endpoint from becoming a general-purpose forward proxy.
+The CLI uses HTTP `CONNECT` over TLS to the configured session-gateway host and port and sends the user bearer credential in the `Authorization` header. The requested asset, action, login, and ephemeral public key use bounded request fields. A successful response creates the bidirectional tunnel defined by [RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6). The request target never names a target or worker. The gateway returns success only after the worker tunnel is ready.
 
-For a CLI SSH tunnel, the CLI creates an ephemeral SSH key pair for the connection. The ticket's confirmation claim contains the public-key fingerprint. The worker terminates the tunneled SSH connection and accepts it only after the SSH client proves possession of that key. The worker presents a short-lived SSH host certificate signed by Tidegate's data-plane SSH CA, which the CLI verifies. Theft of the ticket alone is insufficient, and the gateway cannot substitute an unauthenticated SSH server inside the tunnel.
+The admission ticket stays inside Tidegate. The worker verifies possession of the CLI's ephemeral key before redemption, so a copied ticket does not authenticate a different SSH client. The session-gateway sees CONNECT metadata but cannot read the SSH payload between the CLI and worker.
 
-For a browser session, the requested login is fixed in the ticket because browser JavaScript has no SSH private key. The browser sends the ticket in the body of an HTTPS request to the gateway before opening the WebSocket. The gateway stores it in a short-lived, `Secure`, `HttpOnly` cookie scoped to the session endpoint. `SameSite=Strict` is the default. A deployment with the console and gateway on different sites must opt into `SameSite=None`, keep `Secure`, and configure exact allowed origins. The WebSocket handshake carries the cookie, so the ticket never appears in a URL. The worker consumes the ticket during setup. The gateway validates both the ticket-exchange request and WebSocket `Origin` against the allowlist. Origin checking is the browser isolation control described by [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html); it does not replace ticket validation because non-browser clients can forge the header.
+A browser first sends an authenticated HTTPS session-setup request to the session-gateway. The requested asset and login are in the request body, not the URL. The gateway validates the request origin and CSRF protection before calling `CreateUserSession` with the browser session credential and exact requested scope. It returns the admission ticket in a separate short-lived, `Secure`, `HttpOnly` cookie scoped to the WebSocket endpoint. `SameSite=Strict` is the default. Cross-site deployments use `SameSite=None`, keep `Secure`, and configure an exact origin allowlist.
 
-HTTP access logs and tracing middleware redact authorization fields, cookies, ticket exchange bodies, and WebSocket authentication data. A reverse proxy in front of the gateway must apply the same rule.
+The WebSocket handshake carries the cookie. The session-gateway validates the cookie and `Origin`, selects a worker, and relays the framed browser session. Origin checking follows [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) and does not replace ticket validation because a non-browser client can forge the header. Browser session traffic is visible to the session-gateway.
 
-### Native SSH authentication and admission
+HTTP and gRPC logging middleware redact authorization metadata, cookies, request fields that contain keys or credentials, ticket responses, and WebSocket authentication data. A reverse proxy in front of the session-gateway applies the same rules.
 
-The ssh-gateway presents a stable SSH host key or host certificate for the public Tidegate SSH endpoint. Operators publish that identity with the gateway address. The client verifies it before sending authentication data.
+### Native SSH flow
 
-The outer SSH user name identifies the asset and, if the selected syntax requires it, the Tidegate identity and target login. A registered key can identify the Tidegate user without repeating that identity in the user name. The exact grammar remains open. The gateway rejects ambiguous input and returns the same generic failure for an unknown user, asset, login, or missing authorization.
+The native client makes one SSH connection. The ssh-gateway terminates SSH and presents a stable host key or host certificate for the public Tidegate endpoint. Operators publish that identity with the endpoint.
 
-The outer connection accepts a registered public key or a short-lived Tidegate SSH user certificate. The ssh-gateway completes public-key authentication before requesting admission. An unsigned SSH public-key probe does not create a ticket or reveal whether the asset is authorized. Successful outer authentication grants no shell or forwarding access by itself.
-
-When the authenticated client requests the controlled channel, the ssh-gateway asks the control plane for a session ticket containing the authenticated key fingerprint in its confirmation claim. The control plane verifies that the key belongs to the active user and that the user can reach the asset with at least one SSH login. When the outer selector contains a target login, the control plane checks and binds that login as well. The worker always checks the login requested by the inner SSH connection during preparation.
-
-The client next opens a `direct-tcpip` channel through the outer connection. This is a controlled Tidegate channel, not general port forwarding. Its destination must identify the asset selected during authentication, and the first release permits one inner connection per outer connection. The ssh-gateway obtains the ticket before accepting the channel, opens an HTTPS `CONNECT` tunnel to the session-gateway, and copies the channel bytes into that tunnel.
+The SSH user name identifies the logical asset and target login. A registered public key identifies the Tidegate user, so the user name does not need a separate user identifier. The gateway rejects ambiguous selectors and returns the same generic failure for an unknown key, asset, login, or missing authorization.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as Native SSH client
     participant SG as ssh-gateway
+    participant A as Authority
     participant GW as session-gateway
-    participant CP as Control plane
     participant W as SSH worker
     participant T as SSH target
     participant R as Recording store
 
-    C->>SG: Outer SSH handshake and asset selector
+    C->>SG: SSH handshake and asset/login selector
     SG-->>C: Public gateway host identity
-    C->>SG: Registered public key and signature
-    SG->>SG: Verify signature and resolve user and asset
-    SG-->>C: Outer SSH authentication succeeds
-    C->>SG: Open controlled direct-tcpip channel
-    SG->>CP: Create session bound to registered key fingerprint
-    CP->>CP: Check key registration and asset authorization
-    CP-->>SG: Admission ticket
-    SG->>GW: Open HTTPS CONNECT with bearer ticket
-    GW->>GW: Validate ticket and select SSH worker
-    GW->>W: Open mTLS tunnel and pass ticket
-    C->>W: Inner SSH handshake through opaque tunnel
-    W-->>C: Data-plane SSH host certificate
-    C->>W: Target login, same public key, and fresh signature
-    W->>CP: Prepare session with ticket, login, and public key
-    CP->>CP: Match ticket fingerprint, consume ticket, re-check login, bind worker
-    CP-->>W: Target endpoint, revision, trust anchors, recording policy
+    C->>SG: Public key and authentication signature
+    SG->>SG: Verify SSH signature
+    SG->>A: CreateSSHSession with public key and exact scope
+    A->>A: Resolve key owner and check authorization
+    A-->>SG: Gateway-bound admission ticket
+    SG->>GW: mTLS HTTPS CONNECT with admission ticket
+    GW->>GW: Validate ingress binding and select SSH worker
+    GW->>W: Open mTLS session tunnel and pass ticket
+    W->>A: PrepareSession with ticket
+    A->>A: Consume ticket, re-check authorization, bind worker
+    A-->>W: Target endpoint, trust anchors, and recording policy
     W->>R: Start required recording
-    W->>T: Key exchange and observe target host identity
-    W->>CP: Issue credential for matched identity and worker key
-    CP-->>W: Session-scoped target credential and lease
-    W->>T: Authenticate to target
-    W->>CP: Mark session active
-    C->>W: Open SSH channels through tunnel
-    W->>T: Proxy allowed channel requests
+    W->>T: Connect and verify target host identity
+    W->>A: IssueSessionCredential for observed target and worker key
+    A-->>W: Session credential and lease
+    W->>T: Authenticate target
+    W->>A: ActivateSession
+    W-->>SG: Session ready through tunnel
+    SG-->>C: SSH authentication succeeds
+    C->>SG: Shell, exec, subsystem, and channel data
+    SG->>W: Framed SSH channel events through CONNECT tunnel
+    W->>T: Open and proxy allowed target channels
 ```
 
-The inner SSH handshake is the worker's proof of the client. The worker compares the offered key fingerprint with the ticket confirmation claim, then the SSH protocol verifies a fresh signature from the corresponding private key. A compromised ssh-gateway can request a ticket for a registered fingerprint, but it cannot use that ticket without the private key. The inner encryption also keeps commands and output confidential from both gateways.
+The ssh-gateway calls `CreateSSHSession` only after it verifies the signed public-key authentication request. An unsigned key probe performs no authority call and reveals no authorization result. The authority creates a session only when the key resolves to one active user and that user may access the exact asset and login. The ssh-gateway waits for the worker's ready signal before reporting SSH authentication success, so it does not need to buffer post-authentication channels during target setup.
 
-Tidegate supplies SSH configuration that selects the ssh-gateway as a jump host, fixes the identity used on both connections, and pins separate outer and inner host identities. Users run a normal command such as `ssh deploy@asset`; OpenSSH creates the jump connection without a command-line `-J` option. The configuration sets `IdentitiesOnly` where needed so the outer and inner connections do not select different keys from an agent.
+After admission, the ssh-gateway opens HTTPS `CONNECT` to the session-gateway's internal mutual TLS endpoint. The ticket is a bearer credential in the `Authorization` header and is bound to the ssh-gateway instance. The tunnel carries a versioned stream of SSH channel events. The session-gateway relays the stream without parsing its channel semantics. TLS terminates there, so the session-gateway can read the unparsed stream.
 
-Registered keys authenticate Tidegate and are never installed on targets. Removing a key blocks new outer admissions and inner preparation immediately. Deactivating the user also tears down live sessions. Deployments that require phishing-resistant multi-factor authentication can require short-lived Tidegate SSH user certificates minted after an identity-provider login.
+The ssh-gateway and worker both enforce the ticket's scope. The initial feature set includes shell and exec sessions, PTY allocation, window changes, and bounded environment variables. SFTP is a separately advertised feature because it needs subsystem support and a recording format for binary operations. Commands using exec, including `rsync` and legacy SCP, use the exec path.
 
-### Nested SSH tunnel
+The following requests are denied:
 
-The ssh-gateway terminates only the outer SSH connection. It treats the accepted `direct-tcpip` payload as opaque bytes and applies connection limits and backpressure while copying them to the session-gateway. The session-gateway also treats the payload as opaque. Rekeying, authentication, and channel flow control for the inner connection remain between the client and SSH worker.
-
-The ssh-gateway denies outer shell, exec, subsystem, agent-forwarding, X11, remote-forwarding, and arbitrary `direct-tcpip` requests. It does not provide a general bastion shell. A channel is accepted only for the asset named by the admission ticket and only after the ticketed session-gateway tunnel is ready.
-
-The SSH worker supports the client-facing SSH features Tidegate can proxy and record correctly. The baseline includes shell and exec sessions, PTY allocation, and window changes. Commands carried through exec, including `rsync` and clients using the legacy SCP protocol, fit that model. SFTP requires subsystem support and a binary recording format, so a worker advertises it as a separate feature.
-
-The following SSH features are denied by default:
-
-- Inner `direct-tcpip` and remote TCP forwarding, because they could reach an address that is not the authorized asset. The controlled outer `direct-tcpip` channel is the transport to the worker and is the only exception.
-- SSH agent forwarding, because it would expose the user's authentication agent to the target.
+- Local and remote TCP forwarding, because they can reach an address outside the authorized asset.
+- SSH agent forwarding, because it exposes the user's authentication agent.
 - X11 forwarding, because it adds another bidirectional protocol and client attack surface.
-- Arbitrary environment variables. Workers use an allowlist and reject variables that can alter authentication or recording behavior.
+- Environment variables outside an allowlist.
 
-[RFC 4254](https://www.rfc-editor.org/rfc/rfc4254.html) permits several channels in one SSH connection. Tidegate treats the client connection as one live session with separately identified channels in its recording. A future TEP may authorize forwarding as its own asset and action. It must not enable forwarding as a side effect of SSH login.
+The ssh-gateway rejects these requests at the client boundary, and the worker rejects corresponding session events. An unrestricted shell can still run a tunnel program on the target. Target permissions and network egress policy enforce that separate boundary.
 
-These restrictions remove forwarding features from the SSH protocol surface. They cannot stop a user with an unrestricted shell from running a tunnel program on the target. Operators enforce that boundary through target permissions and network egress policy.
+Registered user keys are never installed on targets. Removing a key blocks new `CreateSSHSession` calls. Deactivating the user also ends live sessions. Deployments that require multi-factor authentication can require short-lived Tidegate SSH user certificates issued after an identity-provider login.
+
+### Future SSH client proof
+
+The initial gRPC API trusts the ssh-gateway's statement that it verified the client signature. A later revision can send verifiable SSH authentication evidence to the authority without adding a second SSH connection.
+
+[RFC 4252, Section 7](https://www.rfc-editor.org/rfc/rfc4252.html#section-7) defines the public-key authentication signature over the SSH session identifier, user name, service name, method, algorithm, and public key. An ssh-gateway that can access those exact fields and the raw signature could include them in `CreateSSHSession`. The authority could reconstruct the signed bytes, verify the signature with the registered key, and require the asset and login to match the signed SSH user name.
+
+This proof needs replay and freshness rules. The standard signature contains no authority-issued nonce or expiry. The authority would need a durable one-use digest for each accepted proof, or a protocol extension that places a short-lived authority challenge in data signed by the client. The latter is difficult to add transparently to unmodified OpenSSH clients. SSH libraries also differ in whether they expose the original signature and session identifier. These constraints keep transcript verification out of the initial API.
+
+Transcript verification would stop a compromised gateway from creating a session without a corresponding client signature. It would not hide session contents from the ssh-gateway. End-to-end confidentiality requires the nested SSH design described under Alternatives.
 
 ### Target verification and credential release
 
-The worker generates a fresh key pair for the target side of an SSH session. The private key remains in worker memory. It is never sent to the control plane, gateway, client, recording store, or logs.
+The worker generates a fresh key pair for the target side of an SSH session. The private key remains in worker memory and is never sent to the authority, a gateway, the client, the recording store, or logs.
 
-`PrepareSession` returns the configured target endpoint, its current endpoint revision, and public trust anchors. The worker connects through SSH key exchange far enough to observe the target host key or host certificate without presenting a user credential. It validates that identity against an approved exact key or host CA, including required host-certificate principals where a CA is used.
+`PrepareSession` returns the configured target endpoint, endpoint revision, and public trust anchors. The worker performs SSH key exchange far enough to observe the target host key or host certificate without presenting a user credential. It matches that identity against an approved exact key or host CA, including required host-certificate principals.
 
 After a local match, the worker calls `IssueSessionCredential` with:
 
@@ -351,170 +384,176 @@ After a local match, the worker calls `IssueSessionCredential` with:
 - The matched trust-anchor identifier and observed fingerprint.
 - The fresh target-side public key.
 
-The control plane confirms that the session is still `preparing`, belongs to the caller, remains authorized, uses the current endpoint revision, and reports an active anchor that matches the observation. It then asks the credential provider to sign the worker's public key as the authorized target login. The certificate expiry is capped by the authorization, session policy, and credential-provider limit. A shared target CA uses an asset-scoped principal enforced through the target's authorized-principals configuration. A target that cannot enforce scoped principals needs its own CA or a different credential provider, because a login-only principal could be accepted by another host that trusts the same CA.
+The authority confirms that the session is still `preparing`, belongs to the caller, remains authorized, uses the current endpoint revision, and reports an active anchor that matches the observation. It then asks the credential provider to sign the worker's public key as the authorized target login. Certificate expiry is capped by the authorization, session policy, and credential-provider limit. A shared target CA uses an asset-scoped principal enforced by the target's authorized-principals configuration. A target that cannot enforce scoped principals needs its own CA or another credential provider.
 
-Credential issuance is idempotent for the same session, worker, anchor, observation, and public key. A retry with different input fails and terminates the session. This rule prevents an uncertain RPC result from creating credentials for several worker keys.
+Credential issuance is idempotent for the same session, worker, anchor, observation, and public key. A retry with different input fails and terminates the session. This prevents an uncertain RPC result from creating credentials for several worker keys.
 
-SSH certificates are the preferred target credential because they can carry a short expiry, target-scoped principals, and the session ID. A password or stored private key may be injected for a target that cannot use a CA. Those credentials remain valid outside the session unless the target or credential provider rotates them, so operators must treat them as a weaker compatibility mode.
+SSH certificates are preferred because they can carry a short expiry, target-scoped principals, and the session ID. A password or stored private key may be injected for a target that cannot trust a Tidegate CA. Those credentials can remain valid outside the session unless the target or provider rotates them, so operators treat them as a weaker compatibility mode.
 
-Admission-ticket signing, mesh TLS, public gateway host identity, internal worker host identity, native user certificates, and target user certificates use separate keys and certificate-authority roles. Compromise of one signer must not grant another purpose.
+Admission-ticket signing, mesh TLS, public gateway host identity, native user certificates, and target user certificates use separate keys and certificate-authority roles. Compromise of one signer does not grant another purpose.
 
-The worker authenticates the already verified target only after credential issuance succeeds. It marks the session `active` after target authentication succeeds and the recorder is ready. If identity verification, credential issuance, or target authentication fails, it closes the target connection, marks the session failed, and discards the fresh private key.
+The worker authenticates the verified target only after credential issuance succeeds. It marks the session `active` after target authentication and recorder setup. A failure closes the target connection, marks the session failed, and discards the fresh private key.
 
 ### Recording and audit
 
-The worker opens the required recording before it requests a target credential. The recording API returns a unique object identifier and a bounded writer. The worker refuses the session if it cannot establish that writer. If the writer blocks beyond its deadline, rejects data, or loses the storage connection, the worker closes the session.
+The worker opens the required recording before requesting a target credential. The recording API returns a unique object identifier and bounded writer. If the writer cannot be established, blocks beyond its deadline, rejects data, or loses storage, the worker refuses or closes the session.
 
-An SSH recording stores channel events with monotonic timestamps, direction, channel ID, event type, and payload. This supports terminal replay and also preserves exec and SFTP traffic without pretending binary traffic is a terminal cast. Recording access is a separate audited capability because recordings may contain credentials typed into a shell and sensitive target data.
+An SSH recording stores channel events with monotonic timestamps, direction, channel ID, event type, and payload. This supports terminal replay and preserves exec and file-transfer traffic without treating binary data as a terminal cast. Recording access is a separate audited capability because recordings can contain credentials typed into a shell and sensitive target data.
 
-The worker reports the recording's size, cryptographic digest, status, and object identifier when the session ends. The control plane appends that metadata to the session audit trail. The recording store should use retention controls or object immutability appropriate to the deployment, as described by [TEP-0004](../0004-scope-and-assumptions/README.md).
+The worker reports recording size, a cryptographic digest, status, and object identifier when the session ends. The authority appends that metadata to the session audit trail. The recording store uses retention controls or object immutability appropriate to the deployment, as described by [TEP-0004](../0004-scope-and-assumptions/README.md).
 
-At minimum, the audit trail records:
+The audit trail records at least:
 
-- Ticket creation, expiry, redemption, and replay rejection.
-- Native SSH authentication success and failure without storing the signature or key material.
+- Session creation, ticket expiry, redemption, and replay rejection.
+- Gateway workload identity and authentication method.
+- For SSH, the registered key identifier and authentication result without storing signatures or key material unnecessarily.
+- Requested and authorized asset, action, and login.
 - Gateway and worker assignment.
-- Authorization source and the result of the prepare-time re-check.
+- Authorization source and prepare-time re-check.
 - Target identity observation and matched anchor.
 - Credential issuance metadata without the credential.
-- Session activation, lease renewal failure, revocation, and end reason.
+- Activation, lease failure, revocation, and end reason.
 - Recording completion or failure.
 
 ### Leases, revocation, and teardown
 
-The control plane gives an active session a short renewable lease. The worker renews it through its existing control stream. The control plane renews only while the user remains active, the authorization still permits the session, the ticket and target facts still match, and no teardown is pending.
+The authority gives an active session a short renewable lease. The worker renews it over `WorkerStream`. Renewal succeeds only while the user remains active, authorization still permits the session, session and target facts still match, and no teardown is pending.
 
-Authorization changes trigger immediate re-evaluation of affected live sessions. The control plane marks the session `terminating` and sends a termination notice independently to the owning worker and the session-gateway carrying the tunnel. Repeated delivery is safe. A periodic sweep covers missed notifications, and lease expiry bounds the effect of a worker losing its control stream.
+Authorization changes cause immediate re-evaluation of affected sessions. The authority marks the session `terminating` and sends termination independently to the worker and the session-gateway carrying the tunnel. Repeated delivery is safe. A periodic sweep covers missed notices, and lease expiry bounds the effect of a worker losing its control stream.
 
-The session-gateway closes the client and worker sides of its tunnel when it receives the notice. The worker closes its client-side and target-side channels when it receives the notice or cannot renew the lease. Either action tears down the data path, while the worker-side check ensures that a compromised or disconnected gateway cannot keep an unauthorized target session alive. For a native session, closing the tunnel ends the inner SSH connection and its `direct-tcpip` channel. The ssh-gateway may keep the outer connection only long enough to report the channel failure before closing it.
+The session-gateway closes both sides of its tunnel. The worker closes its ingress stream and target channels. Either action breaks the data path, while worker enforcement ensures that a compromised or disconnected gateway cannot keep target access alive. For native SSH, the closed CONNECT tunnel tells the ssh-gateway to close the client SSH connection.
 
-The worker reports the final recording result and end reason. The control plane moves the session to `ended` only after that report. A reconciliation sweep marks a session failed if its worker disappears or does not confirm teardown by the deadline.
+The worker reports the final recording result and end reason. The authority moves the session to `ended` only after that report. A reconciliation sweep marks a session failed if its worker disappears or does not confirm teardown by the deadline.
 
 ### Resource limits and failure behavior
 
-Gateways enforce connection-rate, concurrent-connection, handshake-time, header-size, and initial-frame limits before allocating a worker. Protocol gateways also cap authentication attempts and pre-authentication bytes.
+Gateways enforce connection rate, concurrent connections, handshake time, header size, initial frame size, and bounded pre-session buffering. Protocol gateways also cap authentication attempts and unauthenticated bytes.
 
-The control plane enforces deployment-wide per-user and per-asset concurrency in the transaction that redeems a ticket. Workers enforce local connection and channel count, frame size, recorder queue size, idle timeout, absolute session lifetime, target connect timeout, and teardown deadline. Limits are policy inputs owned by the control plane, with safe operator defaults.
+The authority enforces deployment-wide user and asset concurrency in the ticket-redemption transaction. Workers enforce local connection and channel counts, frame size, recorder queue size, idle timeout, absolute lifetime, target-connect timeout, and teardown deadline. Policy supplies these limits with safe operator defaults.
 
-The session fails closed in these cases:
+The session fails closed when:
 
-- The control plane, required recording store, or credential provider is unavailable.
+- The authority, required recording store, or credential provider is unavailable.
+- Client authentication or exact-scope authorization fails.
 - No eligible worker is available.
-- Ticket verification, redemption, proof of possession, or authorization fails.
-- The target endpoint has changed since preparation.
-- The target identity is missing, changed, expired, or unsupported.
+- Ticket verification, ingress binding, or redemption fails.
+- CLI proof of possession fails.
+- The target endpoint changes after preparation.
+- Target identity is missing, changed, expired, or unsupported.
 - Credential issuance has an uncertain non-idempotent result.
 - The worker loses its session lease.
-- A required recorder cannot keep up with traffic.
+- A required recorder cannot keep up.
 
-Client errors stay generic where detail would reveal the existence of a user, asset, login, worker, or trust anchor. The audit event and internal logs carry a stable machine-readable reason for operators.
+Client errors remain generic where detail would reveal a user, key registration, asset, login, worker, or trust anchor. Audit events and internal logs carry stable machine-readable reasons.
 
-### Control-plane contracts
+### Authority contracts
 
-This TEP requires the following logical operations. A later API TEP defines their wire format.
+The initial authority API uses gRPC over mutual TLS. A later API TEP defines protobuf packages and messages.
 
 | Operation | Caller | Result |
 |---|---|---|
-| `CreateSession` | Authenticated CLI or web UI | Creates an `issued` record and returns a ticket plus gateway endpoint. |
-| `CreateNativeSSHSession` | Authenticated ssh-gateway | Checks the registered key, asset authorization, and outer selector, then creates an `issued` record and a key-bound ticket. |
-| `GatewayStream` | Session-gateway | Reports carried session IDs and tunnel closure; streams ticket verification keys, eligible worker roster and capacity changes, and termination notices for those sessions. |
-| `WorkerStream` | Worker | Registers, renews presence and session leases, reports session end, and receives teardown. |
+| `CreateUserSession` | session-gateway | Authenticates the forwarded CLI or browser credential, checks exact scope, creates an `issued` session, and returns a ticket. |
+| `CreateSSHSession` | ssh-gateway | Resolves the presented SSH key or certificate, checks exact scope, creates an `issued` session, and returns an ingress-bound ticket. |
+| `GatewayStream` | session-gateway | Reports carried sessions and tunnel closure; receives ticket keys, worker roster and capacity changes, and termination notices. |
+| `WorkerStream` | Worker | Registers, renews presence and session leases, reports session end, and receives termination notices. |
 | `PrepareSession` | Worker | Consumes a ticket, re-checks authorization, binds the worker, and returns endpoint, trust, and recording policy without a credential. |
-| `IssueSessionCredential` | Owning worker | Re-verifies target identity and returns an idempotent session credential. |
+| `IssueSessionCredential` | Owning worker | Re-verifies target identity facts and returns an idempotent session credential. |
 | `ActivateSession` | Owning worker | Confirms target authentication and moves the prepared session to `active`. |
 
-Every internal operation authenticates the caller through mutual TLS and authorizes its workload role. A gateway identity cannot call worker-only operations, and one worker cannot prepare or issue credentials for another worker's session.
+The authority applies deadlines, request-size limits, idempotency, workload authorization, and audit logging to every method. User credentials, SSH key blobs, signatures, tickets, and credentials are redacted from gRPC logs and traces.
 
 ## Security considerations
 
-- Trust boundaries. User networks are untrusted. Gateways are exposed and terminate user-side TLS or the outer SSH jump connection. Workers and the control plane are internal. Mutual TLS identifies every gateway and worker call. Native and CLI SSH remain encrypted from the client to the worker. The worker independently verifies the key bound to the ticket, so either gateway can disrupt the tunnel but cannot read it, change it, or use the ticket without the client's private key. Gateway termination notices reduce revocation latency and release edge resources, but worker enforcement remains authoritative. Workers are trusted with plaintext session data and one credential for each live session they carry.
-- Privilege. The control plane checks the asset and action at ticket creation. It checks the exact target login during preparation when the inner protocol supplies it. A live session lease never outlasts its grant. The session-gateway accepts `CONNECT` only for its fixed tunnel authority and never treats the request target as a network destination. Inner SSH port forwarding, agent forwarding, and X11 forwarding are disabled because they would add privilege beyond the authorized target login. The outer `direct-tcpip` channel can reach only the ticketed Tidegate worker path.
-- Credentials and secrets. Admission tickets are short-lived and single-use. Proof-of-possession is used where the client can hold a key. Target credentials are released only to the owning worker after target verification. Fresh SSH certificates expire with the session. Tickets, private keys, passwords, and recording data are redacted from logs and traces.
-- Audit. State transitions and security decisions are written with the session ID. Ticket consumption and state transition share a transaction, so a crash cannot admit a session without leaving a replay guard and audit record. Recording metadata includes a digest linked to the session audit trail.
-- Failure behavior. New sessions fail closed when a required dependency is unavailable. Active sessions require renewable leases, so a lost control-plane connection ends them after a bounded interval. Required recording failure ends the session. Teardown messages are idempotent and backed by reconciliation sweeps.
-- Threat model. In scope are a malicious client, a stolen admission ticket, a compromised user key, a network attacker, an impostor target, a compromised gateway, and a compromised worker. Replay guards, proof-of-possession, mutual TLS, target verification, narrow session credentials, and leases limit these threats. A compromised control plane, signing authority, recording store administrator, or worker host can defeat the controls they own and remains an operator-level risk under TEP-0004.
+- Trust boundaries. User networks are untrusted. The ssh-gateway is trusted to authenticate native SSH users. The session-gateway forwards the original CLI bearer or browser session credential for validation by the authority. Both gateways terminate client-facing transports and may see plaintext for the protocols they terminate. CLI SSH remains encrypted between the CLI and worker. Workers and the authority are internal. Mutual TLS identifies every gateway and worker call.
+- Gateway compromise. A compromised gateway can act within the client identities and credentials available to it. The authority still checks exact current authorization, and gateways cannot obtain target credentials or provide target addresses. The simple SSH assertion cannot prove possession to the authority; transcript proof is a future hardening measure.
+- Privilege. The authority checks the exact asset, action, and login at creation and redemption. The session-gateway never treats a CONNECT request target as a network destination. SSH forwarding, agent forwarding, X11, and unapproved environment variables are disabled.
+- Credentials and secrets. Admission tickets are short-lived, single-use, and bound to the expected ingress where applicable. CLI tickets also use proof of possession. Target credentials go only to the owning worker after target verification.
+- Audit. State transitions and security decisions use the session ID. Ticket consumption and state transition share a transaction, so a crash cannot admit a session without a replay guard and audit record.
+- Failure behavior. New sessions fail closed when a required dependency is unavailable. Active sessions require renewable leases. Required recording failure ends the session. Termination messages are idempotent and backed by reconciliation.
+- Threat model. In scope are a malicious client, stolen user credential or ticket, compromised user key, network attacker, impostor target, compromised gateway, and compromised worker. A compromised authority, certificate authority, recording-store administrator, or worker host can defeat the controls it owns and remains an operator-level risk under TEP-0004.
 
 ## Compatibility and upgrade
 
-Tidegate has no released session protocol, so this TEP has no user-facing compatibility requirement.
+Tidegate has no released session protocol, so this TEP has no user-facing compatibility requirement. Native SSH uses a single ordinary SSH connection and requires no `ProxyJump` configuration or second Tidegate host identity.
 
-Internal tickets and tunnel preambles carry explicit versions. Gateways retain each verification key needed by an unexpired ticket and remove it after the last such ticket expires. Workers advertise supported protocol versions, and gateways select only a compatible worker. A rolling upgrade must keep at least one mutually supported version between gateways, workers, and the control plane.
+Admission tickets and session-stream preambles carry explicit versions. Gateways retain each verification key needed by an unexpired ticket. Workers advertise supported protocol, stream, and feature versions. A rolling upgrade keeps at least one mutually supported version between each connected component.
 
-An in-progress session stays pinned to its gateways, worker, tunnel version, and ticket semantics. Deployments drain components before replacing them. A forced replacement closes the session and records the reason; sessions do not migrate between workers.
+An active session stays pinned to its gateways, worker, stream version, and ticket semantics. Deployments drain components before replacing them. A forced replacement closes the session and records the reason; sessions do not migrate between workers.
 
 ## Test plan
 
-Unit tests cover ticket claim validation, signing-key rotation, state transitions, replay races, worker eligibility, SSH selector parsing, key-fingerprint binding, trust-anchor matching, credential idempotency, lease decisions, and error redaction.
+Unit tests cover authentication-context validation, gateway method authorization, SSH key canonicalization, key-owner lookup, exact-scope authorization, ticket claims, ingress binding, state transitions, replay races, idempotency, worker eligibility, target trust, credential issuance, leases, and redaction.
 
 Integration tests cover:
 
-- CLI to session-gateway to SSH worker to target.
-- Browser WebSocket to session-gateway to SSH worker to target.
-- Native OpenSSH outer connection to ssh-gateway, inner connection through session-gateway to SSH worker, and worker connection to target.
-- Rejection of a `CONNECT` request with a missing or invalid bearer ticket, an unexpected authority, or a client-selected destination.
-- Rejection when the outer and inner SSH connections use different keys.
-- Rejection when a compromised ssh-gateway presents an otherwise valid native ticket without a matching inner client signature.
-- Verification of distinct outer-gateway and inner-worker host identities.
-- Shell, exec, PTY resize, and `rsync` behavior, plus SFTP and legacy SCP when those features are advertised.
-- Rejection of TCP, agent, X11, and unapproved environment forwarding.
+- CLI bearer authentication through HTTPS `CONNECT`, ephemeral-key proof at the worker, and target SSH.
+- Browser session authentication, ticket cookie exchange, WebSocket origin checks, and target SSH.
+- Native OpenSSH public-key authentication at the ssh-gateway, gRPC session creation, framed channel proxying, and target SSH.
+- Rejection when a gateway supplies a user ID, fingerprint without a full key, unregistered key, mismatched scope, unauthorized login, or unsupported stream kind.
+- Rejection when the gRPC caller workload is not authorized for the requested method.
+- Rejection of a protocol-gateway ticket on the public CONNECT endpoint, from the wrong mutual TLS identity, or with an unexpected request authority.
+- Shell, exec, PTY resize, and `rsync`, plus SFTP and legacy SCP when advertised.
+- Rejection of TCP, agent, X11, and unapproved environment forwarding at both ssh-gateway and worker.
 - Ticket replay before, during, and after an active session.
-- Ticket replay after preparation, recording setup, target connection, target authentication, or activation fails.
-- Grant revocation, expiry, user deactivation, gateway loss, worker loss, and control-stream loss.
-- Independent teardown at the session-gateway and worker, including a session-gateway that misses or ignores its termination notice.
-- Worker roster and capacity changes affecting new routing decisions without moving live sessions.
+- Ticket replay after preparation, recording, target connection, authentication, or activation fails.
+- Grant revocation, expiry, user deactivation, key removal, gateway loss, worker loss, and control-stream loss.
+- Independent termination at session-gateway and worker, including a gateway that misses or ignores its notice.
+- Worker roster changes affecting new routing decisions without moving live sessions.
 - Target host-key mismatch and endpoint revision changes.
-- Recording unavailable at setup, recorder backpressure, and storage failure during a session.
-- Component rolling upgrades with adjacent protocol versions.
+- Recording unavailability, backpressure, and failure during a session.
+- Rolling upgrades with adjacent protocol versions.
 
-Security tests fuzz every internet-facing parser and internal tunnel preamble. Negative authorization tests attempt to change the asset, login, client-key fingerprint, route, worker, anchor, endpoint revision, or worker public key at each step. Tests for the outer gateway attempt shell, exec, subsystem, agent, X11, remote-forwarding, and arbitrary `direct-tcpip` requests. Load tests hold many idle and active sessions to verify connection limits, backpressure, lease renewal, and teardown latency.
+Security tests fuzz every internet-facing parser, gRPC request parser, and session-stream preamble. Negative tests change the asset, login, public key, route, ingress identity, worker, anchor, endpoint revision, or worker public key at each step. Load tests hold idle and active sessions to verify admission limits, backpressure, lease renewal, and teardown latency.
 
 ## Rollout
 
-1. Implement the persistent session record, ticket issuance, worker stream, prepare operation, leases, and teardown without exposing a public gateway.
-2. Add the session-gateway and SSH worker for CLI sessions, including target verification, SSH certificates, and recording.
-3. Add browser WebSocket sessions through the same worker path.
-4. Add the restricted ssh-gateway, generated OpenSSH configuration, and registered-key binding on the existing session-gateway tunnel path. Enable the outer SSH listener on a separate port for test deployments.
-5. Exercise revocation, dependency failure, parser fuzzing, and rolling upgrades before making either gateway available by default.
+1. Implement the authority's gRPC session record, ticket issuance, worker stream, preparation, leases, and teardown.
+2. Add `CreateUserSession`, the session-gateway, and an SSH worker for CLI `CONNECT` sessions.
+3. Add browser WebSocket sessions through the same session-gateway and worker lifecycle.
+4. Add `CreateSSHSession`, the trusted ssh-gateway, and the framed SSH event stream. Start with shell, exec, PTY, and window changes.
+5. Add optional SFTP and other recorded features after their framing and recording formats pass security review.
+6. Exercise revocation, dependency failure, parser fuzzing, workload-identity enforcement, and rolling upgrades before enabling public gateways by default.
 
-Each stage ships only when its end-to-end negative tests pass. Stored password or private-key injection stays disabled by default until its weaker credential lifetime is documented for operators.
+Stored password or private-key injection stays disabled by default until operators can see and accept its weaker lifetime and revocation properties.
 
 ## Drawbacks
 
-- Native SSH performs an outer and inner SSH handshake before the worker connects to the target. This adds round trips and public-key operations.
-- OpenSSH configuration must select the jump host, the same identity for both handshakes, and the expected outer and inner host identities. Clients that cannot open a `direct-tcpip` channel through a jump host cannot use this ingress.
-- A native SSH connection cannot move to another worker after the inner handshake. Worker or gateway loss ends the connection.
-- The client verifies Tidegate's inner worker identity, while Tidegate verifies the target identity. The client does not verify the target's host key directly.
-- Continuous authorization makes active sessions depend on the control plane and its lease path.
-- Recording every supported channel adds storage, backpressure, and format complexity, especially for binary file transfers.
-- Load balancers and reverse proxies in front of the session-gateway must support long-lived HTTP `CONNECT` requests, bidirectional streaming, backpressure, and tunnel closure without buffering the stream.
+- The ssh-gateway is trusted with native client identity and plaintext. Its compromise can impersonate registered keys known to it within their current authorization.
+- Translating SSH channels into a worker stream adds a protocol boundary that must preserve flow control, request results, exit status, and backpressure.
+- Native sessions depend on both gateways and one worker. Loss of any component ends the connection.
+- Native clients verify the Tidegate ssh-gateway host identity. Tidegate, rather than the client, verifies the target host identity.
+- Continuous authorization makes active sessions depend on the authority and its lease path.
+- Recording every supported channel adds storage and backpressure, especially for binary file transfers.
+- Load balancers and reverse proxies must support long-lived HTTP `CONNECT`, bidirectional streaming, backpressure, and tunnel closure without buffering.
 - Targets that accept only static passwords or private keys weaken the session-scoped credential guarantee.
 
 ## Alternatives
 
-A single public SSH proxy could authenticate the user, obtain the target credential, connect to the target, and record the session. It would place target credentials, plaintext commands, and target-network access in the internet-facing SSH parser. A compromised proxy could impersonate users within any session it admits.
+The native client could create a second SSH connection through the ssh-gateway to the worker. The worker would verify the user's key directly, and both gateways would be blind to the inner SSH payload. This reduces trust in the gateways but requires two SSH handshakes, a second host identity, generated jump-host configuration, and compatible `direct-tcpip` behavior. It remains a possible hardened mode if the simpler trusted-gateway model proves insufficient.
 
-A terminating ssh-gateway could forward verified client-authentication evidence to the worker and bridge SSH channel events. This would require access to the raw SSH signature and session identifier, a custom evidence format, durable replay protection, and a semantic channel bridge. The gateway would still see and could change session contents. The nested connection uses the SSH protocol's existing proof and encryption instead.
+The ssh-gateway could connect directly to targets. That would place target credentials, target-network access, recording, and target host verification in an internet-facing SSH parser. Keeping those responsibilities in the worker limits the ssh-gateway's privilege.
 
-A layer 4 gateway could send every incoming connection to an SSH worker before admission. The worker could then authenticate the client directly, but its SSH parser would be reachable by every internet client and no ticket would exist before worker selection. This conflicts with the requirement that workers receive only admitted sessions.
+A layer 4 gateway could expose workers to incoming SSH before admission. Workers would then authenticate clients directly, but their SSH parsers would be reachable from the internet and no session would exist before worker selection.
 
-An end-to-end `ProxyJump` connection from the client to the target would let the target authenticate the user's key directly. Tidegate could not inject a separate session credential or record plaintext at the worker. The proposed inner connection ends at the worker, preserving both gateway isolation and target-side credential injection.
+The authority could accept a user ID asserted by the ssh-gateway. The public key would then have no effect on the authorization decision, and a gateway bug could select any user. The proposed API requires the full key and derives its registered owner.
 
-The session-gateway could authorize from the signed ticket without an online prepare step. That reduces one control-plane round trip. It cannot reliably detect ticket replay or authorization revoked after minting, and it cannot bind the live session to one worker in the control-plane ledger.
+The session-gateway could authorize from a signed ticket without worker redemption. That would remove one authority round trip but would not reliably detect replay, authorization revoked after creation, or an ineligible worker.
 
-The control plane could release a credential together with the target endpoint during preparation. A worker would then hold a real credential before proving which server it reached. The two-phase prepare and issue flow keeps credentials away from an unverified target.
+The authority could release a target credential during preparation. The worker would then hold a credential before proving which server it reached. The two-phase prepare and issue flow prevents that.
 
 ## Unresolved questions
 
-- What outer SSH user-name and `direct-tcpip` destination syntax identify the Tidegate identity, asset, and optional target login without ambiguous escaping?
-- What generated OpenSSH configuration works across supported clients while forcing the same outer and inner identity and pinning both host identities?
-- Are registered public keys enabled by default, or does the default require a short-lived Tidegate SSH user certificate after identity-provider login?
-- Which SSH environment variables are safe in the initial allowlist?
-- Does the first native SSH release include SFTP and binary channel recording, or does it begin with shell and exec only?
-- Which recording container stores several concurrent SSH channels and supports both terminal replay and binary streams?
-- Which target credential compatibility modes are allowed when the target cannot trust Tidegate's SSH CA, and how are their weaker revocation properties shown to operators?
-- Which HTTP versions are required for `CONNECT` in the first release, and may later versions multiplex several session tunnels on one connection?
-- What lease duration and reconnect grace provide acceptable revocation latency without ending sessions during brief control-plane disruptions?
+- What SSH user-name grammar identifies the logical asset and target login without ambiguous escaping?
+- Which SSH channel events and error mappings make up version 1 of the gateway-worker stream?
+- Does the first native SSH release include SFTP and a binary recording format, or only shell and exec?
+- Are registered public keys enabled by default, or must users present short-lived Tidegate SSH certificates after identity-provider login?
+- Which user credential type and audience does the session-gateway forward to `CreateUserSession`?
+- Which HTTP versions are required for `CONNECT`, and may later versions multiplex session tunnels?
+- What lease duration and reconnect grace provide acceptable revocation latency during brief authority disruptions?
+- Which target credential compatibility modes are allowed when a target cannot trust Tidegate's SSH CA?
+- Should a later release implement SSH transcript proof, and can the selected SSH library expose the exact signed fields without custom client behavior?
 
 ## Implementation history
 
 - 2026-10-19: First draft.
+- 2026-10-23: Replaced nested SSH with a trusted ssh-gateway, adopted the authority naming, introduced its gRPC API, and unified gateway session creation.
