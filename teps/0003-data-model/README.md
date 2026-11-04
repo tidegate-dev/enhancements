@@ -19,7 +19,7 @@ superseded-by: []
 
 This TEP defines the resources the Tidegate authority stores and the rules it uses to decide who may do what. It is a starting model agreed over several maintainer meetings, and later TEPs are expected to refine it.
 
-The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role selects assets by label and grants capabilities on them, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
+The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role uses label selectors and typed, protocol-specific permissions to describe access, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
 
 The model borrows its shape from Kubernetes RBAC. An organization role works like a ClusterRole, a project works like a namespace, and a project role works like a Role.
 
@@ -27,14 +27,14 @@ The model borrows its shape from Kubernetes RBAC. An organization role works lik
 
 Every component described in [TEP-0002](../0002-architecture/README.md) depends on the authority's data model. The API, the CLI, the web UI, the access request flow, and the authorization checks made on behalf of gateways and workers all need the same vocabulary. Agreeing on it before the API TEPs start keeps those TEPs from inventing incompatible versions of the same concepts.
 
-Jumpgate, Tidegate's predecessor, organized assets in a folder tree and let roles cascade down folders through rewrite rules. That model is expressive, but access depends on where an asset sits in the tree and on which rules a role carries, which makes it hard to see why someone has access. The maintainers want a flatter model in which access follows from a short chain of explicit records: a binding, a role, a label selector, and a capability. Labels also suit assets that are discovered or managed by automation, because tooling can set labels without placing assets in a hierarchy.
+Jumpgate, Tidegate's predecessor, organized assets in a folder tree and let roles cascade down folders through rewrite rules. That model is expressive, but access depends on where an asset sits in the tree and on which rules a role carries, which makes it hard to see why someone has access. The maintainers want a flatter model in which access follows from a short chain of explicit records: a binding, a role, a matching asset rule, and the typed permission that allowed the operation. Labels also suit assets that are discovered or managed by automation, because tooling can set labels without placing assets in a hierarchy.
 
 The model also has to separate administration of Tidegate from access through Tidegate. In a PAM system, holding an organization role that manages users or identity providers should not grant shell access to production as a side effect, and owning a project should not allow changing organization settings. This separation covers roles and bindings inside Tidegate. Groups mapped to an identity provider extend trust to whoever manages group membership at that provider, as described under [Groups](#groups) and [Security considerations](#security-considerations).
 
 ### Goals
 
 - Define the resources the authority stores, their scope (organization or project), and how they reference each other.
-- Define how an access decision is evaluated, from a user's identity to a capability on an asset.
+- Define how an access decision is evaluated, from a user's identity to a typed permission on an asset.
 - Define how group membership is derived from identity provider claims, and keep that mapping explicit.
 - Define the lifecycle of just-in-time access, from policy to request, approval, time-limited binding, and revocation.
 - Define the rules that prevent a user from granting more access than they hold.
@@ -44,7 +44,7 @@ The model also has to separate administration of Tidegate from access through Ti
 ### Non-goals
 
 - Database schemas, API definitions, and wire formats. A future TEP might define them.
-- The full list of protocol scopes, actions, and qualifiers. Each worker TEP defines the capabilities for its protocol.
+- The complete schema of protocol-specific asset permissions. Each worker TEP defines the typed fields and matching behavior for its protocol.
 - Asset connection details, credential configuration, and target identity pinning. These belong to the asset catalog and worker TEPs.
 - Identity provider protocols. This TEP assumes OIDC for examples but does not choose the supported set.
 - Implementing the organization as a resource, and multi-organization support. The organization is described so the model has room for it, but the first implementation stores no organization record or organization identifier, and the API does not expose one.
@@ -88,12 +88,12 @@ erDiagram
 | Organization | Instance | Cluster | Top-level tenant. Implicit for now: one per instance, not stored and not exposed in the API. |
 | IdentityProvider | Organization | none | Configuration for an external identity provider, such as an OIDC issuer. |
 | User | Organization | User | A person or service account that can sign in. |
-| OrgRole | Organization | ClusterRole | A set of governance capabilities, such as managing users or creating projects. |
+| OrgRole | Organization | ClusterRole | A schema-validated set of governance permissions, such as managing users or creating projects. |
 | OrgBinding | Organization | ClusterRoleBinding | Gives an OrgRole to a user or a shared group. |
 | Project | Organization | Namespace | Boundary for assets and the access rules that apply to them. |
 | Group | Project | none | A set of users and other groups. Optionally shared with other projects, optionally mapped to an IdP group. |
 | Asset | Project | none | A target that Tidegate brokers access to, such as an SSH host, a database, or a cluster. Carries labels. |
-| Role | Project | Role | A label selector and a set of capabilities. |
+| Role | Project | Role | Schema-validated asset access rules and project-wide governance permissions. |
 | Binding | Project | RoleBinding | Gives a Role to a user or group, permanently or until an expiry time. |
 | AccessPolicy | Project | none | Says who may request a Role, who approves, and for how long. |
 | AccessRequest | Project | none | A user's request for a Role under an AccessPolicy. |
@@ -116,7 +116,7 @@ Some users also need a local password. When the IdP is down or misconfigured, ad
 
 ### Organization roles and bindings
 
-An OrgRole holds governance capabilities: what a subject may administer at the organization level. Examples are managing users, configuring identity providers, creating and deleting projects, managing organization roles and bindings, and reading the audit log.
+An OrgRole has a schema-validated spec that describes governance permissions: what a subject may administer at the organization level. Examples are managing users, configuring identity providers, creating and deleting projects, managing organization roles and bindings, and reading the audit log. The spec uses defined fields with defined behavior, rather than free-form capability strings.
 
 Organization roles never grant access to assets. A user who holds a superadmin OrgRole cannot open a session to any asset until a project binding gives them a project role. This keeps the administrators of Tidegate itself separate from the people who use it to reach infrastructure, and makes access to assets visible in exactly one place: project bindings.
 
@@ -151,31 +151,42 @@ A group can combine an external reference with explicitly listed members. Member
 
 An Asset is a target that Tidegate brokers access to: an SSH host, a Windows host, a database, a Kubernetes cluster, or another kind supported by a worker. Every asset belongs to one project and has a kind, a name unique within its project, and kind-specific configuration defined by the asset catalog and worker TEPs.
 
-Assets carry labels: key-value pairs in the style of Kubernetes object labels, such as `env: prod` or `team: payments`. Labels are the only way roles select assets. Changing an asset's labels can therefore change who has access to it, so updating labels requires its own project capability, described under [Project capabilities](#project-capabilities).
+Assets carry labels: key-value pairs in the style of Kubernetes object labels, such as `env: prod` or `team: payments`. Labels are the only way roles select assets. Changing an asset's labels can therefore change who has access to it, so updating labels requires its own project-wide permission, described under [Project-wide permissions](#project-wide-permissions).
 
-### Roles and capabilities
+### Role specifications and permissions
 
-A Role is a project-level set of capabilities, optionally limited by a label selector. A role with a selector applies to the project's assets whose labels match it. A role without a selector applies to the whole project.
+A Role has a schema-validated spec with two independent concerns:
 
-A capability has three parts:
+- Asset access rules associate a label selector with typed, protocol-specific permissions. A matching rule applies only to assets in the role's project. A rule without a selector applies to every asset in that project, including assets added later.
+- Project-wide permissions govern project resources such as groups, roles, bindings, access policies, assets, and asset labels. Asset selectors do not narrow these permissions.
 
-- A scope, which names the area the capability applies to. For asset access the scope is a protocol such as `ssh`, `rdp`, `postgres`, or `kubernetes`. For project administration the scope is a resource type such as `groups` or `roles`.
-- An action within that scope, such as `login` for SSH.
-- A qualifier that narrows the action, such as the account name.
+Role and OrgRole specs do not contain generic strings such as `project:role:edit` or `{scope, action, qualifier}` triples. Their allowed fields, values, and authorization behavior are defined by their schemas. Unknown fields and invalid combinations are rejected. Each worker TEP adds the typed asset permissions for its protocol, such as the SSH accounts or Kubernetes groups a matching rule permits.
 
-For example, a role with the capability `scope: ssh, action: login, qualifier: root` and the selector `env: staging` allows its holders to log in as `root` to every SSH asset in the project labeled `env: staging`. The meaning of the qualifier depends on the scope: the account for SSH and RDP, the database role for Postgres, and the Kubernetes group to impersonate for clusters. A qualifier of `*` matches any value. Each worker TEP defines the actions and qualifiers for its protocol.
+The following example illustrates the intended shape, not final field names. It gives holders the Kubernetes `editor` group on matching assets and lets them edit access policies throughout the project:
 
-#### Project capabilities
+```yaml
+kind: Role
+name: admin
+project: myproject
+spec:
+  matches:
+    - labelSelector: ...
+      kubernetesGroup: editor
+  projectWide:
+    policyEditor: true
+```
 
-Project capabilities govern the project itself: who may create and change groups, roles, bindings, access policies, and assets, and who may change asset labels. They use resource types as their scope, for example `scope: bindings, action: create`.
+The detailed schemas will be developed from concrete user needs. Later TEPs may change names such as `matches`, `kubernetesGroup`, and `projectWide` before the API becomes stable, but they must preserve the separation between typed asset permissions and typed governance permissions.
 
-Project capabilities only take effect in a role without a selector. A label selector chooses assets, and creating a group or a role is not an action on an asset, so a project capability inside a selected role has nothing to apply to. The authority rejects roles that combine a selector with project capabilities, so an author cannot write a role that looks more powerful than it is.
+#### Project-wide permissions
+
+Project-wide permissions describe who may create and change groups, roles, bindings, access policies, and assets, and who may change asset labels. They are explicit fields in the Role spec rather than encoded strings. A role may contain both asset access rules and project-wide permissions; the authority evaluates each part independently, so a label selector never appears to restrict a project-wide permission.
 
 ### Bindings
 
 A Binding gives a Role to a subject within a project. The subject is a user, a group in the same project, or a shared group from another project.
 
-A binding without an expiry time is standing access. It lasts until someone deletes it. A binding with an expiry time is temporary access, and the authority removes it when it expires. Temporary bindings are usually created by an approved access request, described below, and record the request that created them. An administrator with the right capability can also create a temporary binding directly, for example to grant access during a planned maintenance window.
+A binding without an expiry time is standing access. It lasts until someone deletes it. A binding with an expiry time is temporary access, and the authority removes it when it expires. Temporary bindings are usually created by an approved access request, described below, and record the request that created them. An administrator with the required project-wide permission can also create a temporary binding directly, for example to grant access during a planned maintenance window.
 
 When a binding expires or is deleted, live sessions that depend on it end, as described under continuous revocation in [TEP-0002](../0002-architecture/README.md#continuous-revocation).
 
@@ -214,9 +225,9 @@ The authority enforces these rules:
 
 ### Who can grant access
 
-Creating a binding or an access policy hands out the capabilities of a role, so the authority checks two things. The creator must hold the project capability to create bindings or policies. The creator must also be entitled to the role being granted: either they hold every capability the role grants, on every asset the role currently selects, or they hold an explicit `bind` capability on that role. This mirrors the escalation check in Kubernetes RBAC, where creating a RoleBinding requires holding the role's permissions or the `bind` verb on it.
+Creating a binding or an access policy hands out the permissions of a role, so the authority checks two things. The creator must hold the project-wide permission to create bindings or policies. The creator must also be entitled to everything the role grants: either they hold every effective permission represented by the role's typed spec, on every asset its rules currently select, or their own spec explicitly permits binding that role. This mirrors the escalation check in Kubernetes RBAC, where creating a RoleBinding requires holding the role's permissions or the `bind` verb on it.
 
-The same rule applies to roles. Creating or changing a role requires the project capability to manage roles, and the new or changed role cannot grant capabilities on assets the author could not grant themselves. Without this rule, a user allowed to edit roles could widen a role they are already bound to.
+The same rule applies to roles. Creating or changing a role requires the corresponding project-wide permission, and the new or changed role cannot grant asset or governance permissions the author is not entitled to delegate. Without this rule, a user allowed to edit roles could widen a role they are already bound to. The concrete Role schema defines the explicit fields for binding or delegating permissions; they are not magic capability strings.
 
 ### Declarative configuration
 
@@ -237,8 +248,14 @@ spec:
 kind: OrgRole
 name: superadmin
 spec:
-  capabilities:
-    - { scope: "*", action: "*", qualifier: "*" }
+  # Illustrative typed governance fields; the exact schema is defined separately.
+  users:
+    editor: true
+  identityProviders:
+    editor: true
+  projects:
+    creator: true
+    reader: true
 ---
 kind: Project
 name: system
@@ -275,7 +292,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 ### User stories
 
 - A platform administrator bootstraps a new instance from a configuration file. Members of the company's `admin` IdP group can then sign in and administer the organization with no further setup.
-- The payments team owns the `payments` project. A team lead labels the production hosts `env: prod`, defines a role `prod-root` with the selector `env: prod` and the capability `scope: ssh, action: login, qualifier: root`, and an access policy that lets the `payments-devs` group request it for up to two hours with one approval from the `payments-leads` group.
+- The payments team owns the `payments` project. A team lead labels the production hosts `env: prod`, defines a role `prod-root` with an asset rule that matches `env: prod` and permits SSH login as `root`, and an access policy that lets the `payments-devs` group request it for up to two hours with one approval from the `payments-leads` group.
 - A developer in `payments-devs` requests `prod-root` for 30 minutes to investigate an incident. A lead approves, the developer gets a binding that expires in 30 minutes, and their SSH session ends when it expires.
 - The security team defines a shared group `security-oncall` in its own project. Other projects reference it as an approver group in their access policies, and the security team updates its membership in one place.
 - During an IdP outage, an administrator signs in with a break-glass account to fix the identity provider configuration. The login raises an alert in the organization's SIEM.
@@ -283,11 +300,11 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 
 ### Risks and mitigations
 
-- Label changes change access. Adding `env: prod` to an asset gives every role that selects `env: prod` access to it. Changing labels requires a dedicated project capability, label changes are audited, and the access check always evaluates current labels so the effect is immediate and visible.
+- Label changes change access. Adding `env: prod` to an asset makes every asset rule that selects `env: prod` applicable to it. Changing labels requires a dedicated project-wide permission, label changes are audited, and the access check always evaluates current labels so the effect is immediate and visible.
 - Shared groups widen the impact of a membership change. Adding a user to a shared group can grant access in projects the group owner never looks at. Only the owning project can change membership, and the audit record of a membership change lists where the group is referenced.
 - IdP-derived membership can be stale. A user removed from an IdP group keeps the Tidegate membership until their claims are refreshed. Claims are refreshed on every sign-in and token refresh, and the session lifetime bounds how long stale membership can last.
 - Break-glass accounts bypass the IdP, including its MFA and offboarding. Local login is opt-in per user, every local login is a distinct audit event, and the number of such accounts is expected to be small.
-- A selector-less role grants access to every asset in the project, including assets added later. The API and UI show such roles as project-wide, and the escalation check treats them as granting their capabilities on all project assets.
+- An asset access rule without a selector applies to every asset in the project, including assets added later. The API and UI show such rules as matching all project assets, and the escalation check treats their typed permissions accordingly.
 
 ## Design details
 
@@ -297,29 +314,29 @@ When a worker asks the authority whether a user may perform an action on an asse
 
 ```mermaid
 flowchart TB
-    start(["user, asset, scope, action, qualifier"])
+    start(["user, asset, requested protocol operation"])
     subjects["Resolve the user's subjects:<br>the user, plus every group they belong to,<br>directly, through nesting, or through IdP claims"]
     bindings["Find bindings in the asset's project<br>whose subject is in that set<br>and that have not expired"]
-    roles["Keep roles whose selector matches<br>the asset's labels, or that have no selector"]
-    caps["Look for a capability matching<br>scope, action, and qualifier"]
+    roles["Find asset access rules whose<br>label selector matches the asset,<br>or that have no selector"]
+    permissions["Evaluate the requested operation<br>against the rule's typed permissions"]
     allow(["allow"])
     deny(["deny"])
-    start --> subjects --> bindings --> roles --> caps
-    caps -->|"match"| allow
-    caps -->|"no match"| deny
+    start --> subjects --> bindings --> roles --> permissions
+    permissions -->|"allowed"| allow
+    permissions -->|"not allowed"| deny
     bindings -->|"none"| deny
     roles -->|"none"| deny
 ```
 
 The model has no deny rules. Access is the union of what all applicable bindings grant, which keeps the result independent of evaluation order and makes every grant traceable to a single binding. Organization roles do not take part in asset access checks.
 
-Checks for administrative actions follow the same steps with project capabilities and selector-less roles, or with organization capabilities and org bindings, depending on the resource.
+Checks for administrative actions follow the same subject and binding resolution, then evaluate the relevant typed project-wide or organization-governance field. Asset selectors do not participate in administrative checks.
 
-### Capability matching
+### Permission matching and validation
 
-A capability matches a requested action when each of its three parts equals the requested value or is `*`. For asset scopes, the qualifier comparison is exact, so a role granting `scope: ssh, action: login, qualifier: deploy` does not allow logging in as `root`. Each worker TEP defines how its qualifiers are spelled, for example whether Kubernetes qualifiers name groups or users.
+The authority validates Role and OrgRole specs against the schema for their resource and API version when they are written. Unknown permission fields, unknown protocol sections, invalid values, and invalid field combinations are rejected rather than ignored.
 
-Jumpgate supported richer globs, including a trailing `**` that matched a whole scope. This TEP starts with a single `*` per part and leaves richer matching to later TEPs if a need appears.
+At evaluation time, the authority uses the behavior defined for the relevant typed field. For example, the SSH worker TEP defines how a role expresses permitted accounts, while the Kubernetes worker TEP defines how a role expresses groups or users to impersonate. There is no common wildcard or string-matching language across these schemas. Broad grants and protocol-specific exclusions, where needed, must be explicit parts of the relevant typed spec.
 
 ### Group membership from identity providers
 
@@ -334,11 +351,11 @@ Organization-level resources have names unique within the organization for their
 ## Security considerations
 
 - Trust boundaries. Identity providers are trusted to authenticate users and to assert group claims, but only for the groups that Tidegate explicitly maps, and only for the provider each mapping names. Using an IdP for sign-in already places it inside the trust boundary, because an IdP administrator who can sign in as a user holds that user's access in Tidegate. Multi-factor authentication with a factor only the user holds, such as a hardware key, prevents this kind of impersonation. It does not prevent an IdP administrator from adding their own account to a mapped IdP group and so granting themselves access. Group mapping is opt-in per group for this reason. Projects form an administrative boundary: a project's administrators can affect other projects only through groups they share.
-- Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. It does allow changing the IdP configuration or group mappings, which can lead to access indirectly, so organization roles must be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting capabilities they do not hold.
+- Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. It does allow changing the IdP configuration or group mappings, which can lead to access indirectly, so organization roles must be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting permissions they are not entitled to delegate.
 - Credentials and secrets. This model stores local password hashes for break-glass users and IdP client secrets. Both are stored encrypted or hashed and never returned through the API. Bootstrap configuration must not contain plaintext passwords; how the first break-glass password is delivered is an open question.
-- Audit. Every create, update, and delete of a resource in this model is audited, along with access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, and capability that allowed it.
-- Failure behavior. Unknown capabilities, unresolvable references, and roles that fail validation are rejected when they are written. At evaluation time, a binding whose role or subject cannot be resolved grants nothing. If the IdP is unavailable, IdP users cannot sign in, and break-glass accounts are the fallback.
-- Threat model. In scope are a malicious requester, a compromised approver, a malicious project administrator, and a compromised IdP account. Self-approval is impossible, temporary access cannot be used to approve other requests, a project administrator cannot grant capabilities beyond their own or affect projects that do not reference their shared groups, and IdP claims only affect explicitly mapped groups. A compromised identity provider can assert any mapped group and is out of scope for mitigation in this model. Organizations that need protection against it can require approvals from users who sign in with a separate factor, which a later TEP can address.
+- Audit. Every create, update, and delete of a resource in this model is audited, along with access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, matching asset rule, and typed permission that allowed it.
+- Failure behavior. Unknown spec fields, unresolvable references, and roles that fail validation are rejected when they are written. At evaluation time, a binding whose role or subject cannot be resolved grants nothing. If the IdP is unavailable, IdP users cannot sign in, and break-glass accounts are the fallback.
+- Threat model. In scope are a malicious requester, a compromised approver, a malicious project administrator, and a compromised IdP account. Self-approval is impossible, temporary access cannot be used to approve other requests, a project administrator cannot grant permissions beyond those they may delegate or affect projects that do not reference their shared groups, and IdP claims only affect explicitly mapped groups. A compromised identity provider can assert any mapped group and is out of scope for mitigation in this model. Organizations that need protection against it can require approvals from users who sign in with a separate factor, which a later TEP can address.
 
 ## Compatibility and upgrade
 
@@ -371,7 +388,7 @@ A folder hierarchy with inherited roles, as in jumpgate, models organizational s
 
 Storing an organization identifier on every record now, with a single organization created at bootstrap, would make multi-organization support a smaller change later. It would also add a column, a scope on every query and uniqueness constraint, and a code path that nothing exercises until the feature exists. The maintainers prefer to pay for a migration if and when multi-organization support is built.
 
-A single level of roles, where organization administration is expressed as capabilities in some special project, would remove the OrgRole and OrgBinding kinds. It would also let a project administrator of that special project gain organization rights, and it would mix governance and access in one evaluation path.
+A single level of roles, where organization administration is expressed as fields in the Role spec of some special project, would remove the OrgRole and OrgBinding kinds. It would also let a project administrator of that special project gain organization rights, and it would mix governance and access in one evaluation path.
 
 Implicit mapping of IdP groups to Tidegate groups by name would remove a configuration step. It would also let anyone who can create groups at the IdP grant themselves membership in any Tidegate group with the same name.
 
@@ -380,16 +397,15 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 ## Unresolved questions
 
 - What should the "shared" flag be called? Meetings used both "shared" and "exported", and an early bootstrap draft used `extern`. This TEP uses `shared`.
-- Should OrgRole and Role, and OrgBinding and Binding, be merged into one Role and one Binding kind, where omitting `project` makes the resource organization-scoped? Organization-scoped roles would still accept only governance capabilities and no selector, so the separation between administration and asset access stays, with fewer resource kinds to learn. This mirrors Kubernetes, where ClusterRole and Role share one schema.
 - Can org bindings be requested through access policies, so that organization administration is also just-in-time? This TEP allows org bindings with an expiry time but defines access policies only for project roles.
 - Do local-login accounts require a second factor, such as TOTP or WebAuthn, and how is the first password delivered without putting it in the bootstrap file?
 - Does creating a project automatically bind its creator to a project administrator role, and should Tidegate ship built-in project roles?
-- Can organization administrators recover a project whose administrators have all left, and if so, through which capability?
-- Should roles with a selector be able to delegate management of the assets they select, for example letting a team edit only assets labeled with its own team name? This TEP limits project capabilities to selector-less roles.
+- Can organization administrators recover a project whose administrators have all left, and if so, through which typed governance permission?
+- Should an asset access rule be able to delegate management of the assets it selects, for example letting a team edit only assets labeled with its own team name? Project-wide permissions are deliberately not narrowed by asset selectors.
 - Should access requests be able to ask for less than a whole role, for example one asset of the role's selection, as jumpgate grants were bound to a single asset?
 - How does the declarative format handle re-applying a bootstrap file to a running instance: create missing resources only, or reconcile and delete?
 - Should labels be limited to a defined key set per project, to keep label conventions consistent?
-- How are negative capabilities expressed? Some protocols need a broad grant with exceptions, for example impersonating `cluster-admin` in a Kubernetes cluster while the proxy blocks requests to the `kube-system` namespace. Such exclusions would be enforced by the worker inside a session, which differs from the deny rules rejected under [Alternatives](#alternatives): they narrow what one capability allows instead of overriding grants from other bindings. The open questions are where exclusions are declared (on the capability, the role, or the asset), how they combine when several bindings apply, and which workers can enforce them.
+- How are protocol-specific exclusions expressed? Some protocols need a broad grant with exceptions, for example impersonating `cluster-admin` in a Kubernetes cluster while the proxy blocks requests to the `kube-system` namespace. Such exclusions would be represented in that protocol's typed spec and enforced by the worker inside a session. This differs from the deny rules rejected under [Alternatives](#alternatives): an exclusion narrows one permission instead of overriding grants from other bindings. The open questions are where exclusions are declared, how they combine when several bindings apply, and which workers can enforce them.
 
 ## Implementation history
 
