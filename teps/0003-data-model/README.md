@@ -147,6 +147,8 @@ By default a group is visible only within its project. A group marked as shared 
 
 Sharing lets an organization define a group such as `security-team` once, in a project that owns it, and reuse it everywhere. Only the owning project can change a shared group's membership, so other projects reference it but cannot alter it.
 
+Every cross-project group reference names both the owning project and the group. A bare group name is resolved only within the current project, so shared groups with the same name in different projects remain unambiguous.
+
 A group can also carry an external reference to a group at an identity provider. A user who signs in through that IdP and presents the referenced group in their group claim becomes a member of the Tidegate group for as long as the claim says so. Tidegate never maps IdP groups implicitly: an IdP group named `admins` has no effect until some Tidegate group references it by provider and value. An external reference names the IdP as well as the group value, so a group claim from one provider cannot satisfy a reference meant for another.
 
 An external reference makes the IdP's group administrators part of the Tidegate group's trust: whoever can add a user to the IdP group grants that user the Tidegate group's access, including themselves. For this reason mapping is opt-in per group, and a project can keep its sensitive groups limited to explicitly listed members.
