@@ -112,7 +112,9 @@ An IdentityProvider resource configures an external identity source, for example
 
 A User is an organization-level identity. Users are referenced by name across all projects, so the same person has one user record no matter how many projects they work in. A user can be linked to one or more external identities, each identified by the provider and the subject the provider asserts. A user who signs in through an IdP for the first time gets a user record created and linked automatically. Signing in never links a new external identity to an existing user by matching email addresses, because an attacker who controls an email address at one provider could otherwise take over an account created through another.
 
-Some users also need a local password. When the IdP is down or misconfigured, administrators must still be able to sign in and repair the instance. A user marked for local login can authenticate with a password stored as a salted hash in the authority, independent of any IdP. Local login is opt-in per user, intended for a small number of break-glass accounts, and every local login is recorded as a distinct audit event so it can trigger alerts. Whether local login also requires a second factor is an open question.
+Some users also need local login. When the IdP is down or misconfigured, administrators must still be able to sign in and repair the instance. Local login is opt-in per user and intended for a small number of break-glass accounts. It requires both a password and an enrolled second factor, such as TOTP or a passkey, and every local login is recorded as a distinct audit event so it can trigger alerts.
+
+The authority stores local passwords only as self-describing password-hash strings. The initial implementation accepts [Argon2id](https://www.rfc-editor.org/rfc/rfc9106.html) in [PHC string format](https://c2sp.org/phc-strings), which identifies the algorithm, version and cost parameters alongside the salt and hash. This makes the method explicit and lets the authority reject unsupported algorithms or parameters below its security policy. The exact second-factor enrollment, storage, and recovery fields are defined by the authentication and API TEPs; local login cannot succeed until an accepted factor is enrolled.
 
 ### Organization roles and bindings
 
@@ -241,7 +243,13 @@ The same rule applies to roles. Creating or changing a role requires the corresp
 
 ### Declarative configuration
 
-Every resource has the same shape: a `kind`, a `name`, a `project` for project-level resources, and a `spec`. The CLI can apply resources in this shape, and a new instance reads a bootstrap file in the same format on first start. Bootstrap creates enough resources for administrators to sign in and take over.
+Every resource has the same shape: a `kind`, a `name`, a `project` for project-level resources, and a `spec`. The authenticated CLI can apply resources in this shape during normal operation.
+
+A new instance can accept a bootstrap file in the same format exactly once. The authority validates and applies the complete file in one transaction and records successful initialization in that transaction. If validation or application fails, the transaction is rolled back, the instance remains uninitialized, and the operator can retry. After either bootstrap or interactive initial-administrator creation succeeds, the authority rejects all later bootstrap input; later configuration changes use the authenticated API or CLI and their normal authorization checks.
+
+As an alternative to a bootstrap file, an operator can run `authority create-initial-admin` against an uninitialized instance with no User records. The command interactively creates the initial User, enrolls a password and second factor, creates the superadmin OrgRole if needed, creates its OrgBinding, and marks the instance initialized in one transaction. It reads the password interactively, hashes it inside the authority, and never accepts it in a command-line argument or writes it to logs.
+
+Declarative local-login credentials contain a precomputed, self-describing hash in a field such as `passwordHash`; plaintext passwords are rejected. A schematic Argon2id value has the form `$argon2id$v=19$m=<memory>,t=<iterations>,p=<parallelism>$<salt>$<hash>`. An acceptable enrolled second factor must also be present before the account can be used. The field names for that factor are left to the authentication and API TEPs.
 
 ```yaml
 kind: IdentityProvider
@@ -253,7 +261,9 @@ spec:
 kind: User
 name: breakglass
 spec:
-  localLogin: true
+  localLogin:
+    passwordHash: "$argon2id$v=19$m=<memory>,t=<iterations>,p=<parallelism>$<salt>$<hash>"
+    secondFactor: ... # Illustrative; the authentication TEP defines this field.
 ---
 kind: OrgRole
 name: superadmin
@@ -303,11 +313,12 @@ spec:
     name: breakglass
 ```
 
-In this example, members of the IdP group `admin` at the `github` provider become members of the shared `system/admins` group when they sign in, and through the OrgBinding they hold the `superadmin` organization role. The `breakglass` user can sign in with a local password when the IdP is unavailable. Neither has access to any asset until a project binding grants it.
+In this example, members of the IdP group `admin` at the `github` provider become members of the shared `system/admins` group when they sign in, and through the OrgBinding they hold the `superadmin` organization role. Once provisioned with the concrete second-factor fields defined by the authentication TEP, the `breakglass` user can sign in with its local password and second factor when the IdP is unavailable. Neither has access to any asset until a project binding grants it.
 
 ### User stories
 
 - A platform administrator bootstraps a new instance from a configuration file. Members of the company's `admin` IdP group can then sign in and administer the organization with no further setup.
+- An operator who does not use a bootstrap file runs `authority create-initial-admin`, enters a password without exposing it in process arguments, enrolls a second factor, and receives the first local organization-administrator account. The command cannot run again after initialization.
 - An organization administrator creates the `payments` project. The authority creates its standard project-administrator Role and binds the creator to it in the same transaction. The creator can then add the team's administrators and remove their own binding.
 - The payments team owns the `payments` project. A team lead labels the production hosts `env: prod`, defines a role `prod-root` with an asset rule that matches `env: prod` and permits SSH login as `root`, and an access policy that lets the `payments-devs` group request it for up to two hours with one approval from the `payments-leads` group.
 - A developer in `payments-devs` requests `prod-root` for 30 minutes to investigate an incident. A lead approves, the developer gets a binding that expires in 30 minutes, and their SSH session ends when it expires.
@@ -321,7 +332,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 - Separate assets can reach the same underlying system. Revoking or changing one project's asset does not affect another project's definition for the same endpoint. Operators must update each definition when a shared target changes, and audit records identify the project and asset used for each session.
 - Shared groups widen the impact of a membership change. Adding a user to a shared group can grant access in projects the group owner never looks at. Only the owning project can change membership, and the audit record of a membership change lists where the group is referenced.
 - IdP-derived membership can be stale. A user removed from an IdP group keeps the Tidegate membership until their claims are refreshed. Claims are refreshed on every sign-in and token refresh, and the session lifetime bounds how long stale membership can last.
-- Break-glass accounts bypass the IdP, including its MFA and offboarding. Local login is opt-in per user, every local login is a distinct audit event, and the number of such accounts is expected to be small.
+- Break-glass accounts bypass the IdP and its offboarding process. Local login has its own mandatory second factor, is opt-in per user, and produces a distinct audit event. The number of such accounts is expected to be small and operators must manage their lifecycle explicitly.
 - An asset access rule without a selector applies to every asset in the project, including assets added later. The API and UI show such rules as matching all project assets, and the escalation check treats their typed permissions accordingly.
 
 ## Design details
@@ -372,7 +383,7 @@ Organization-level resources have names unique within the organization for their
 
 - Trust boundaries. Identity providers are trusted to authenticate users and to assert group claims, but only for the groups that Tidegate explicitly maps, and only for the provider each mapping names. Using an IdP for sign-in already places it inside the trust boundary, because an IdP administrator who can sign in as a user holds that user's access in Tidegate. Multi-factor authentication with a factor only the user holds, such as a hardware key, prevents this kind of impersonation. It does not prevent an IdP administrator from adding their own account to a mapped IdP group and so granting themselves access. Group mapping is opt-in per group for this reason. Projects form an administrative boundary: a project's administrators can affect other projects only through groups they share.
 - Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. Organization governance can still lead to access indirectly: depending on the OrgRole spec, an administrator may change IdP configuration or group mappings, administer project resources, or invoke project recovery and then delegate project roles. Organization roles must therefore be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting permissions they are not entitled to delegate outside these explicit governance paths.
-- Credentials and secrets. This model stores local password hashes for break-glass users and IdP client secrets. Both are stored encrypted or hashed and never returned through the API. Bootstrap configuration must not contain plaintext passwords; how the first break-glass password is delivered is an open question.
+- Credentials and secrets. Local passwords are stored only as self-describing hashes, initially Argon2id PHC strings. IdP client secrets and secret material used by second factors are encrypted at rest; password hashes and secrets are never returned through the API. Bootstrap rejects plaintext passwords, unsupported hash algorithms, hashes below the configured security policy, and local-login users without an accepted second factor. Interactive initial-administrator creation reads the password without exposing it in process arguments or logs.
 - Audit. Every create, update, and delete of a resource in this model is audited, along with project recovery, access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, matching asset rule, and typed permission that allowed it.
 - Failure behavior. Unknown spec fields, unresolvable references, and roles that fail validation are rejected when they are written. At evaluation time, a binding whose role or subject cannot be resolved grants nothing. If the IdP is unavailable, IdP users cannot sign in, and break-glass accounts are the fallback.
 - Threat model. In scope are a malicious requester, a compromised approver, a malicious project administrator, and a compromised IdP account. Self-approval is impossible, temporary access cannot be used to approve other requests, a project administrator cannot grant permissions beyond those they may delegate or affect projects that do not reference their shared groups, and IdP claims only affect explicitly mapped groups. A compromised identity provider can assert any mapped group and is out of scope for mitigation in this model. Organizations that need protection against it can require approvals from users who sign in with a separate factor, which a later TEP can address.
@@ -383,7 +394,7 @@ Tidegate has no released version, so this TEP has no compatibility impact. The a
 
 ## Test plan
 
-This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, tests that project creation atomically establishes its initial administrator, tests that project recovery can bind only the standard administrator role, and tests that self-approval and approval through temporary bindings are rejected.
+This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, tests that project creation atomically establishes its initial administrator, tests that project recovery can bind only the standard administrator role, and tests that self-approval and approval through temporary bindings are rejected. Initialization tests cover transactional bootstrap, retry after rollback, rejection after successful initialization, the initial-administrator command's guards, PHC string validation and minimum parameters, rejection of plaintext passwords, and mandatory second-factor enrollment for local login.
 
 ## Rollout
 
@@ -422,10 +433,8 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 
 - What should the "shared" flag be called? Meetings used both "shared" and "exported", and an early bootstrap draft used `extern`. This TEP uses `shared`.
 - Can org bindings be requested through access policies, so that organization administration is also just-in-time? This TEP allows org bindings with an expiry time but defines access policies only for project roles.
-- Do local-login accounts require a second factor, such as TOTP or WebAuthn, and how is the first password delivered without putting it in the bootstrap file?
 - Should an asset access rule be able to delegate management of the assets it selects, for example letting a team edit only assets labeled with its own team name? Project-wide permissions are deliberately not narrowed by asset selectors.
 - Should access requests be able to ask for less than a whole role, for example one asset of the role's selection, as jumpgate grants were bound to a single asset?
-- How does the declarative format handle re-applying a bootstrap file to a running instance: create missing resources only, or reconcile and delete?
 - Should labels be limited to a defined key set per project, to keep label conventions consistent?
 - How are protocol-specific exclusions expressed? Some protocols need a broad grant with exceptions, for example impersonating `cluster-admin` in a Kubernetes cluster while the proxy blocks requests to the `kube-system` namespace. Such exclusions would be represented in that protocol's typed spec and enforced by the worker inside a session. This differs from the deny rules rejected under [Alternatives](#alternatives): an exclusion narrows one permission instead of overriding grants from other bindings. The open questions are where exclusions are declared, how they combine when several bindings apply, and which workers can enforce them.
 
