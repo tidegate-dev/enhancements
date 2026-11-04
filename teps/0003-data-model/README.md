@@ -8,7 +8,7 @@ approvers:
   - "@tidegate-dev/maintainers"
 tracking-issue: null
 created: 2026-10-02
-last-updated: 2026-10-05
+last-updated: 2026-11-04
 replaces: []
 superseded-by: []
 ---
@@ -134,7 +134,7 @@ A project is the boundary for assets and the rules that govern access to them. E
 
 Projects let teams own their part of the asset inventory. A team that owns a project can label assets, define roles, and approve requests without organization-wide privileges and without affecting other projects.
 
-Creating a project also bootstraps its administration. In the same transaction, the authority creates a standard project-administrator Role and binds the user who created the project to it. That role contains the project-wide permissions needed to administer the project, including defining and binding roles, but contains no asset access rules. The creator may add other administrators and may remove their own binding, even when that leaves the project without an administrator; an organization administrator with the project-recovery permission can recover it later.
+Creating a project also bootstraps its administration. In the same transaction, the authority creates a standard project-administrator Role and binds the user who created the project to it. That role contains the project-wide permissions and explicit delegation authority needed to define and bind any Role in the project, but contains no asset access rules and therefore grants no session access itself. The creator may add other administrators and may remove their own binding, even when that leaves the project without an administrator; an organization administrator with the project-recovery permission can recover it later.
 
 ### Groups
 
@@ -440,4 +440,5 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 
 ## Implementation history
 
+- 2026-11-04: Incorporated maintainer meeting decisions: authority terminology, typed Role and OrgRole specs, project administration and recovery, project-qualified shared-group references, project-owned assets, and one-time bootstrap with MFA-protected local login.
 - 2026-10-02: First draft, based on the model agreed in several maintainer meetings.
