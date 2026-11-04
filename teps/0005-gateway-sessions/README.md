@@ -24,7 +24,7 @@ TEP-0002 names the central decision-making component the `authority`; this TEP u
 All ingress paths use the same authority and worker lifecycle:
 
 - A CLI authenticates to the authority with an opaque login token, requests an exact session with an ephemeral client key, and then opens HTTPS `CONNECT` to the session-gateway with the resulting admission ticket.
-- A browser authenticates to the session-gateway with its session cookie and opens a WebSocket after session creation.
+- A browser authenticates to the authority with its browser session credential and requests an exact session. It sends the resulting admission ticket to a session-gateway HTTPS setup endpoint, receives a gateway-hosted admission cookie, and opens the WebSocket with that cookie.
 - A native SSH client opens one SSH connection to the ssh-gateway. The ssh-gateway terminates SSH, verifies the user's public-key signature, and asks the authority to create the session for that public key and the requested scope.
 
 The ssh-gateway is trusted to report successful client authentication. The authority derives the user from the complete public key or user certificate, so the gateway cannot choose a subject independently of that authentication material. Public keys are not secret, so possession remains an assertion made by the trusted ssh-gateway in the initial API. The gateway translates the client SSH connection into a framed session stream for the SSH worker. The session-gateway routes that stream without interpreting SSH channel semantics. The worker alone connects to the target, verifies its identity, obtains the target credential, records the session, and enforces the session lease.
@@ -55,11 +55,15 @@ Native SSH also needs a clear trust decision. A nested SSH design can keep sessi
 - Defining the exact SSH username syntax used to name an asset and target login.
 - Designing protocol gateways other than SSH. They use the lifecycle in this TEP but need protocol-specific authentication and translation rules.
 - Allowing arbitrary TCP forwarding through Tidegate. A worker connects only to the endpoint of the authorized asset.
-- Protecting a user from a compromised public gateway. Public gateways are trusted authenticators in this proposal.
-- Defining the browser login-session credential. This TEP defines how the session-gateway forwards it but leaves its format and lifecycle to the authentication and API TEPs.
+- Protecting session contents from a compromised public gateway for a transport that terminates there. Protocol gateways are trusted authenticators, while the session-gateway is a trusted ticket router and can see browser session traffic.
+- Defining the browser login-session credential. The authentication and API TEPs define its format and lifecycle. This TEP defines how the resulting admission ticket reaches the session-gateway without exposing that browser credential.
 - Defining high-availability or multi-region deployment topology.
 
 ## Proposal
+
+### Deployment assumptions
+
+The authority and session-gateway have different public DNS names. The authority therefore cannot set a host-only cookie for the session-gateway. Browser session setup uses a separate HTTPS request to the session-gateway so that the gateway can set its own host-only admission cookie before the browser opens a WebSocket. The browser UI origin and session-gateway origin are configured explicitly; neither trusts arbitrary origins.
 
 ### Terms
 
@@ -83,7 +87,7 @@ Every component fails closed. Missing, stale, ambiguous, inconsistent, unverifia
 
 1. A client chooses a logical asset and operation. It never supplies a real network address for a target or worker.
 2. A session-creation request contains the exact protocol, action, and qualifier being requested. The authority resolves the user from authentication material and ignores or rejects a caller-supplied subject.
-3. The authority accepts each session-creation operation only from its permitted caller. A CLI authenticates to the user-facing operation with its login token. A gateway calls only its permitted internal operation under its mutual TLS workload identity.
+3. The authority accepts each session-creation operation only from its permitted caller. A CLI or browser authenticates to a user-facing operation with its login credential. A gateway calls only its permitted internal operation under its mutual TLS workload identity.
 4. An ssh-gateway request contains the complete SSH public key or user certificate. A key must resolve to exactly one active registered owner. For a user certificate, the authority validates the issuer, validity, and principal before deriving the user. A fingerprint or user ID supplied by the gateway is not authoritative.
 5. A ticket can be redeemed at most once and starts at most one live session. Consumption is recorded durably before the authority returns target details. Once recorded, consumption is irreversible even if later setup fails. A retry requires a new ticket.
 6. A gateway may authenticate a client, request a session, reject a connection, route it, translate its client protocol, and enforce limits. It cannot obtain or issue a target credential.
@@ -94,6 +98,7 @@ Every component fails closed. Missing, stale, ambiguous, inconsistent, unverifia
 11. Required recording starts before target authentication. A recording failure refuses or ends the session.
 12. Revocation, lease expiry, user deactivation, worker loss, and authorization expiry end the session.
 13. Tickets, user credentials, target credentials, private keys, other secrets, and recording contents are excluded from logs.
+14. A browser login credential is accepted only by the authority. The session-gateway accepts a browser WebSocket only when its host-only admission cookie contains a valid ticket for the exact session path and the request has an allowed `Origin`.
 
 ### Components and responsibilities
 
@@ -121,9 +126,12 @@ flowchart LR
     cli -->|"HTTPS API<br/>login token + scope"| auth
     auth -->|"admission ticket"| cli
     cli -->|"HTTPS CONNECT<br/>admission ticket"| sessiongw
-    browser -->|"HTTPS + WSS<br/>session cookie + scope"| sessiongw
+    browser -->|"HTTPS API<br/>browser credential + scope"| auth
+    auth -->|"admission ticket"| browser
+    browser -->|"HTTPS setup<br/>bearer admission ticket"| sessiongw
+    sessiongw -->|"host-only admission cookie"| browser
+    browser -->|"WSS<br/>admission cookie"| sessiongw
     ssh -->|"SSH"| sshgw
-    sessiongw -->|"CreateBrowserSession gRPC"| auth
     sshgw -->|"CreateSSHSession gRPC<br/>public key + scope"| auth
     sshgw -->|"mTLS HTTPS CONNECT<br/>ticket + session stream"| sessiongw
     sessiongw -->|"mTLS session tunnel"| worker
@@ -135,7 +143,7 @@ flowchart LR
 
 The authority is the only component that decides whether a session may be created or continued. It owns identities, registered SSH keys, authorization, the asset catalog, live session state, ticket signing keys, trust anchors, credential providers, and the audit log.
 
-The session-gateway is a ticket-aware session router. It terminates public HTTPS and WebSocket connections, accepts admission tickets from CLI users, requests sessions for authenticated browser users, performs preliminary ticket checks, selects workers, and relays session streams. It also accepts mutually authenticated tunnels from protocol gateways. Its local ticket check rejects malformed, expired, or misrouted requests early. Authoritative admission happens when the worker redeems the ticket with the authority.
+The session-gateway is a ticket-aware session router. It terminates public HTTPS and WebSocket connections, accepts admission tickets from CLI users, exchanges browser admission tickets for gateway-hosted cookies, performs preliminary ticket checks, selects workers, and relays session streams. It also accepts mutually authenticated tunnels from protocol gateways. Its local ticket check rejects malformed, expired, or misrouted requests early. Authoritative admission happens when the worker redeems the ticket with the authority.
 
 The ssh-gateway is the SSH server seen by native clients. It presents Tidegate's public SSH host identity, parses the logical asset and target login, verifies client public-key authentication, and requests the corresponding session from the authority. It translates allowed SSH connection-protocol messages into the framed session stream consumed by the SSH worker. The ssh-gateway sees commands, file-transfer data, and output for native SSH sessions.
 
@@ -144,7 +152,7 @@ The SSH worker owns the target side. It redeems the ticket, opens the recorder, 
 ### User stories
 
 - A CLI user runs `tidegate connect deploy@web-01`. The CLI asks the authority for the exact session using its login token and an ephemeral SSH public key, then opens HTTPS `CONNECT` to the session-gateway with the returned admission ticket.
-- A user starts a terminal in the web UI. The session-gateway uses the browser session credential to request the exact asset and login, then relays the WebSocket session to the worker.
+- A user starts a terminal in the web UI. The browser uses its session credential with the authority to request the exact asset and login, exchanges the resulting admission ticket for a session-gateway cookie, and opens the WebSocket with that cookie.
 - A user runs a normal OpenSSH command against the Tidegate SSH endpoint. The ssh-gateway verifies the key signature, the authority resolves its registered owner and authorization, and Tidegate proxies the resulting SSH channels through the session-gateway and worker.
 - An approver revokes a grant while a shell is open. The authority tells the session-gateway and worker to close the session. Lease expiry covers a missed notification.
 - A target presents an unapproved host key. The worker stops before credential issuance and records a target-identity failure.
@@ -153,7 +161,8 @@ The SSH worker owns the target side. It redeems the ticket, opens the recorder, 
 
 - A compromised ssh-gateway can request a session for any registered public key it knows. Public keys are not secrets, so requiring a key in the gRPC request limits the request to a real user and current authorization but does not prove that the user participated. Mutual TLS, method-level workload authorization, exact scope checks, rate limits, and audit reduce exposure. The future proof described below can require a fresh user signature.
 - A stolen CLI login token can be used against the authority's user API until it expires or is revoked. It never passes through the session-gateway. The default lifetime is bounded, the authority stores only a digest, logout revokes the login session, and every use is subject to current user state and authorization.
-- A compromised session-gateway can use a browser session credential that passes through it while that credential remains valid. The browser credential should have a narrow audience and short lifetime. Its exact design is outside this TEP. The authority still enforces current authorization and session limits.
+- A stolen browser session credential can be used against the authority for as long as that credential remains valid. It never passes through the session-gateway. Its format, lifetime, and revocation behavior are defined by the authentication and API TEPs.
+- A stolen browser admission ticket can bootstrap its exact session before expiry. The ticket is short-lived and single-use, the gateway setup endpoint accepts it only from configured browser origins, and authoritative redemption still occurs once at the worker.
 - A stolen native admission ticket is usable only through the session-gateway endpoint, before expiry and redemption, from the gateway workload identity named by the ticket. The gateway-to-gateway `CONNECT` endpoint requires mutual TLS.
 - A compromised public gateway can read or alter sessions that terminate there. It still cannot obtain a target credential or choose a target address. The worker receives both from the authority and verifies target identity first.
 - A compromised worker can read its sessions and misuse a current target credential. Session-scoped credentials, narrow target principals, short expiry, and revocation limit the exposure. Stored passwords and private keys are a weaker compatibility mode.
@@ -209,11 +218,11 @@ The token is accepted only by the authority's user-facing API and is sent in pro
 
 ### Authority session APIs
 
-The CLI calls the authority's authenticated user-facing API. Gateways and workers call the internal authority API through gRPC over mutual TLS. A gateway's client certificate identifies its workload type and instance. Method-level authorization prevents one gateway type from using another gateway's session-creation operation and prevents any gateway from calling worker-only credential operations. A later API TEP defines the external and internal wire formats.
+The CLI and browser call the authority's authenticated user-facing API. Gateways and workers call the internal authority API through gRPC over mutual TLS. A gateway's client certificate identifies its workload type and instance. Method-level authorization prevents one gateway type from using another gateway's session-creation operation and prevents any gateway from calling worker-only credential operations. A later API TEP defines the external and internal wire formats.
 
 For CLI ingress, the user-facing session-creation operation receives the login token, exact asset, protocol, action, qualifier, stream kind, and optional client proof-of-possession key. The authority hashes the token, looks up an active and unexpired login-session record, checks that the user remains active, and derives the user from that record. It does not validate a signature on the opaque token and accepts no authoritative `subject` field. After checking the exact authorization, it creates the session and returns its admission ticket and session-gateway endpoint directly to the CLI.
 
-For browser ingress, `CreateBrowserSession` is called by the session-gateway. The request carries the exact scope and the original browser session credential as per-call gRPC credentials or equivalent protected metadata. The authority validates that credential and derives the user from it. The request has no authoritative `subject` field. The browser credential's format and login lifecycle are outside this TEP.
+For browser ingress, the browser calls the user-facing session-creation operation with its browser session credential and the exact requested scope. The authority validates that credential, derives the user from it, checks authorization, and returns an admission ticket and session-gateway HTTPS setup endpoint directly to the browser. The request has no authoritative `subject` field. The browser credential's format and login lifecycle are outside this TEP.
 
 `CreateSSHSession` serves native SSH ingress. Its request contains:
 
@@ -226,7 +235,7 @@ The authority parses and canonicalizes a public key, computes its fingerprint wi
 
 An unsigned SSH public-key query does not call `CreateSSHSession`. The ssh-gateway first verifies the signed authentication request. It sends SSH authentication success only after the authority creates the session. Retries with the same gateway instance and connection identifier return the same result, so an uncertain gRPC response cannot create several sessions.
 
-Each session-creation response contains a one-use admission ticket and the session-gateway endpoint. A CLI ticket is valid only at the public session-gateway ingress. A CLI SSH ticket is bound to the required ephemeral client key. Tickets created for protocol gateways name the exact ingress workload identity. The session-gateway accepts protocol-gateway tickets only on its mutual TLS endpoint from that identity.
+Each session-creation response contains a one-use admission ticket and the appropriate session-gateway endpoint. A CLI ticket is valid only at the public `CONNECT` ingress. A browser ticket is valid only at the browser setup and WebSocket ingress. A CLI SSH ticket is bound to the required ephemeral client key. Tickets created for protocol gateways name the exact ingress workload identity. The session-gateway accepts protocol-gateway tickets only on its mutual TLS endpoint from that identity.
 
 ### Admission tickets
 
@@ -246,7 +255,7 @@ An admission ticket carries routing and authorization context:
 | `issued_at`, `not_before`, `expires_at` | Ticket validity interval. |
 | `issuer`, `audience`, `key_id` | Signature validation and signing-key rotation. |
 
-The ticket contains no target address, target credential, user credential, secret, or policy document. Signed claims are visible to the ticket holder and are not confidential.
+The ticket contains no target address, target credential, user credential, secret, or policy document. Signed claims are visible to the ticket holder and are not confidential. Its encoded form is bounded so it fits the configured HTTP header and browser cookie limits.
 
 The session-gateway validates the signature, audience, validity interval, ingress binding, protocol, stream kind, and route before selecting a worker. This preliminary check limits load and rejects obvious misuse. Worker redemption at the authority remains authoritative because it detects replay, revocation, authorization changes, and an ineligible worker.
 
@@ -271,7 +280,7 @@ A connection failure before redemption permits another worker selection. Once re
 
 ### CLI and browser flow
 
-CLI and browser ingress share the same admission and worker lifecycle but authenticate differently. The CLI creates its session directly through the authority's user-facing API, so its login token never reaches the session-gateway. For a browser, the session-gateway forwards the browser session credential to the authority. In both cases the authority sees the original authentication context and derives the user itself.
+CLI and browser ingress share the same admission and worker lifecycle and both create their sessions directly through the authority's user-facing API. Their login credentials never reach the session-gateway. The authority sees the original authentication context, derives the user itself, and returns an admission ticket for the exact authorized session.
 
 ```mermaid
 sequenceDiagram
@@ -310,9 +319,17 @@ The CLI first sends the requested asset, action, login, and ephemeral public key
 
 The CLI login token stays between the CLI and authority. The worker verifies possession of the CLI's ephemeral key before ticket redemption, so a copied admission ticket does not authenticate a different SSH client. The session-gateway sees CONNECT metadata and the admission ticket but cannot read the SSH payload between the CLI and worker.
 
-A browser first sends an authenticated HTTPS session-setup request to the session-gateway. The requested asset and login are in the request body, not the URL. The gateway validates the request origin and CSRF protection before calling `CreateBrowserSession` with the browser session credential and exact requested scope. It returns the admission ticket in a separate short-lived, `Secure`, `HttpOnly` cookie scoped to the WebSocket endpoint. `SameSite=Strict` is the default. Cross-site deployments use `SameSite=None`, keep `Secure`, and configure an exact origin allowlist.
+A browser first sends an authenticated HTTPS session-creation request to the authority. The requested asset and login are in the request body, not the URL. The authority validates the browser credential, request origin, and applicable CSRF protection before returning the admission ticket and session-gateway setup endpoint.
 
-The WebSocket handshake carries the cookie. The session-gateway validates the cookie and `Origin`, selects a worker, and relays the framed browser session. Origin checking follows [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) and does not replace ticket validation because a non-browser client can forge the header. Browser session traffic is visible to the session-gateway.
+The standard in-browser [`WebSocket` API](https://websockets.spec.whatwg.org/#the-websocket-interface) accepts only a URL and optional subprotocol names; it gives JavaScript no way to add an arbitrary `Authorization` header to the opening handshake. An ordinary HTTPS request can carry that header but cannot become the WebSocket exposed to JavaScript. The separate setup request bridges this browser API limitation without putting a bearer credential in the URL, abusing WebSocket subprotocol negotiation, or waiting until after the upgrade to authenticate.
+
+Browser JavaScript then sends an HTTPS `POST` to that setup endpoint with the admission ticket in the `Authorization` header. The request uses CORS with one exact configured browser origin, permits credentials, and allows only the required method and headers. The session-gateway validates the ticket using the same verifier as CLI `CONNECT`, allocates no worker, and responds with the WebSocket endpoint and an admission cookie containing the ticket.
+
+The admission cookie is host-only and has `Secure`, `HttpOnly`, and the narrowest usable `SameSite` setting. Same-site deployments use `SameSite=Strict`; a cross-site deployment requires `SameSite=None`, `Secure`, and an exact origin allowlist. Its `Path` names one unique WebSocket endpoint, such as `/sessions/<session-id>/ws`, and its expiry is no later than the ticket expiry. A unique path lets several browser sessions be prepared concurrently without their cookies overwriting one another. The cookie has no `Domain` attribute and the browser login credential is never sent to the session-gateway.
+
+The browser opens the returned WebSocket endpoint, automatically sending the admission cookie. Before returning `101 Switching Protocols`, the session-gateway checks the exact `Origin`, extracts and revalidates the ticket, and requires its `session_id` to match the WebSocket path. Only then does it select a worker and relay the framed browser session. Origin checking follows [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) and does not replace ticket validation because a non-browser client can forge the header. Browser session traffic is visible to the session-gateway.
+
+The setup request does not consume the ticket. Ticket redemption remains the worker's atomic transition at the authority, so several setup or WebSocket attempts can race but at most one can start a live session. The ticket never appears in a URL, WebSocket subprotocol, log, trace, or browser-readable cookie.
 
 HTTP and gRPC logging middleware redact authorization metadata, cookies, request fields that contain keys or credentials, ticket responses, and WebSocket authentication data. Any reverse proxy in front of the authority or session-gateway applies the same rules.
 
@@ -463,12 +480,12 @@ Client errors remain generic where detail would reveal a user, key registration,
 
 ### Authority contracts
 
-The internal authority API uses gRPC over mutual TLS. The CLI uses the authenticated user-facing authority API. A later API TEP defines the external and internal protocols, packages, and messages; the operation names below are conceptual.
+The internal authority API uses gRPC over mutual TLS. The CLI and browser use the authenticated user-facing authority API. A later API TEP defines the external and internal protocols, packages, and messages; the operation names below are conceptual.
 
 | Operation | Caller | Result |
 |---|---|---|
 | `CreateCLISession` | CLI | Looks up the opaque login token, derives the user, checks exact scope, creates an `issued` session, and returns a ticket and session-gateway endpoint. |
-| `CreateBrowserSession` | session-gateway | Authenticates the forwarded browser credential, checks exact scope, creates an `issued` session, and returns a ticket. |
+| `CreateBrowserSession` | Browser | Authenticates the browser credential, derives the user, checks exact scope, creates an `issued` session, and returns a ticket and session-gateway setup endpoint. |
 | `CreateSSHSession` | ssh-gateway | Resolves the presented SSH key or certificate, checks exact scope, creates an `issued` session, and returns an ingress-bound ticket. |
 | `GatewayStream` | session-gateway | Reports carried sessions and tunnel closure; receives ticket keys, worker roster and capacity changes, and termination notices. |
 | `WorkerStream` | Worker | Registers, renews presence and session leases, reports session end, and receives termination notices. |
@@ -480,10 +497,10 @@ The authority applies deadlines, request-size limits, idempotency, caller authen
 
 ## Security considerations
 
-- Trust boundaries. User networks are untrusted. The CLI presents its login token directly to the authority and presents only a scoped admission ticket to the session-gateway. The ssh-gateway is trusted to authenticate native SSH users, and the session-gateway forwards browser session credentials for validation by the authority. Both gateways terminate client-facing transports and may see plaintext for the protocols they terminate. CLI SSH remains encrypted between the CLI and worker. Workers and the authority are internal. Mutual TLS identifies every gateway and worker call.
-- Gateway compromise. A compromised session-gateway can steal a browser credential that passes through it, but it never sees a CLI login token. A CLI SSH admission ticket permits only its exact session and requires proof of the ephemeral client key. A compromised ssh-gateway can assert possession of registered public keys it knows. The authority still checks exact current authorization, and gateways cannot obtain target credentials or provide target addresses. SSH transcript proof is a future hardening measure.
+- Trust boundaries. User networks are untrusted. The CLI and browser present their login credentials directly to the authority and present only scoped admission tickets to the session-gateway. The ssh-gateway is trusted to authenticate native SSH users. Both gateways terminate client-facing transports and may see plaintext for the protocols they terminate. CLI SSH remains encrypted between the CLI and worker. Workers and the authority are internal. Mutual TLS identifies every gateway and worker call.
+- Gateway compromise. A compromised session-gateway sees CLI and browser admission tickets but never their login credentials. Each ticket permits only its exact session; a CLI SSH ticket additionally requires proof of the ephemeral client key. A compromised ssh-gateway can assert possession of registered public keys it knows. The authority still checks exact current authorization, and gateways cannot obtain target credentials or provide target addresses. SSH transcript proof is a future hardening measure.
 - Privilege. The authority checks the exact asset, action, and login at creation and redemption. The session-gateway never treats a CONNECT request target as a network destination. SSH forwarding, agent forwarding, X11, and unapproved environment variables are disabled.
-- Credentials and secrets. CLI login tokens are high-entropy opaque values stored only as digests by the authority, expire after a bounded lifetime, and can be revoked immediately. Admission tickets are short-lived, single-use, and bound to the expected ingress where applicable. CLI tickets also use proof of possession. Target credentials go only to the owning worker after target verification.
+- Credentials and secrets. CLI login tokens are high-entropy opaque values stored only as digests by the authority, expire after a bounded lifetime, and can be revoked immediately. Browser login credentials also remain authority-only. Admission tickets are short-lived, single-use, and bound to the expected ingress where applicable. Browser cookies carry only admission tickets and are host-only, `Secure`, `HttpOnly`, path-scoped, and no longer-lived than the ticket. CLI tickets also use proof of possession. Target credentials go only to the owning worker after target verification.
 - Audit. State transitions and security decisions use the session ID. Ticket consumption and state transition share a transaction, so a crash cannot admit a session without a replay guard and audit record.
 - Failure behavior. New sessions fail closed when a required dependency is unavailable. Active sessions require renewable leases. Required recording failure ends the session. Termination messages are idempotent and backed by reconciliation.
 - Threat model. In scope are a malicious client, stolen user credential or ticket, compromised user key, network attacker, impostor target, compromised gateway, and compromised worker. A compromised authority, certificate authority, recording-store administrator, or worker host can defeat the controls it owns and remains an operator-level risk under TEP-0004.
@@ -504,7 +521,8 @@ Integration tests cover:
 
 - CLI login, direct session creation at the authority, admission-ticket authentication through HTTPS `CONNECT`, ephemeral-key proof at the worker, and target SSH.
 - CLI login-token expiry, logout revocation, user deactivation, concurrent logout and session creation, absence of plaintext tokens from storage, and redaction from logs, traces, and audit events.
-- Browser session authentication, ticket cookie exchange, WebSocket origin checks, and target SSH.
+- Browser authentication directly at the authority, cross-origin ticket setup at the session-gateway, admission-cookie attributes and expiry, concurrent session paths, WebSocket origin and path checks, and target SSH.
+- Rejection when browser setup has an unapproved CORS origin, sends a browser login credential, omits or changes the bearer ticket, exceeds header or cookie limits, or attempts to use one session's cookie on another session path.
 - Native OpenSSH public-key authentication at the ssh-gateway, gRPC session creation, framed channel proxying, and target SSH.
 - Rejection when a gateway supplies a user ID, fingerprint without a full key, unregistered key, mismatched scope, unauthorized login, or unsupported stream kind.
 - Rejection when the gRPC caller workload is not authorized for the requested method.
@@ -526,7 +544,7 @@ Security tests fuzz every internet-facing parser, gRPC request parser, and sessi
 
 1. Implement the authority's login-session and proxied-session records, ticket issuance, worker stream, preparation, leases, and teardown.
 2. Add the user-facing CLI session-creation operation, the session-gateway, and an SSH worker for CLI `CONNECT` sessions.
-3. Add browser WebSocket sessions through the same session-gateway and worker lifecycle.
+3. Add direct browser session creation at the authority, the session-gateway HTTPS cookie-bootstrap endpoint, and WebSocket sessions through the same gateway and worker lifecycle.
 4. Add `CreateSSHSession`, the trusted ssh-gateway, and the framed SSH event stream. Start with shell, exec, PTY, and window changes.
 5. Add optional SFTP and other recorded features after their framing and recording formats pass security review.
 6. Exercise revocation, dependency failure, parser fuzzing, workload-identity enforcement, and rolling upgrades before enabling public gateways by default.
@@ -544,6 +562,7 @@ Stored password or private-key injection stays disabled by default until operato
 - Load balancers and reverse proxies must support long-lived HTTP `CONNECT`, bidirectional streaming, backpressure, and tunnel closure without buffering.
 - Targets that accept only static passwords or private keys weaken the session-scoped credential guarantee.
 - CLI session setup uses one authority request followed by a separate connection to the session-gateway, and the two public endpoints must remain consistently discoverable and reachable.
+- Browser session setup uses an authority request, a CORS-protected session-gateway setup request, and then the WebSocket connection. Separate DNS names keep login credentials away from the gateway but require this extra round trip and careful origin and cookie configuration.
 
 ## Alternatives
 
@@ -555,7 +574,9 @@ A layer 4 gateway could expose workers to incoming SSH before admission. Workers
 
 The authority could accept a user ID asserted by the ssh-gateway. The public key would then have no effect on the authorization decision, and a gateway bug could select any user. The proposed API requires the full key and derives its registered owner.
 
-The CLI could send its general login token to the session-gateway, which could forward it to the authority while requesting the session. This would save the direct CLI-to-authority session-creation call, but a compromised gateway could retain the token and impersonate the user against the authority API for the token's remaining lifetime. The proposed flow gives the gateway only a short-lived, single-use admission ticket for one exact session.
+The CLI or browser could send its general login credential to the session-gateway, which could forward it to the authority while requesting the session. This would save the direct client-to-authority session-creation call, but a compromised gateway could retain the credential and impersonate the user against the authority API for its remaining lifetime. The proposed flow gives the gateway only a short-lived, single-use admission ticket for one exact session.
+
+The browser could carry its admission ticket directly in the WebSocket handshake without a setup request. The standard browser WebSocket API cannot set an `Authorization` header. Putting the ticket in the URL risks logging it, using `Sec-WebSocket-Protocol` conflates a secret with protocol negotiation, and sending it as the first message authenticates only after the connection is upgraded. Because the authority and session-gateway have different DNS names, the authority also cannot set a host-only gateway cookie. The HTTPS setup exchange lets the gateway validate the bearer in a normal authorization header and set its own cookie before the WebSocket upgrade.
 
 The session-gateway could authorize from a signed ticket without worker redemption. That would remove one authority round trip but would not reliably detect replay, authorization revoked after creation, or an ineligible worker.
 
@@ -576,4 +597,4 @@ The authority could release a target credential during preparation. The worker w
 
 - 2026-10-19: First draft.
 - 2026-10-23: Replaced nested SSH with a trusted ssh-gateway, adopted the authority naming, introduced its gRPC API, and unified gateway session creation.
-- 2026-11-04: Defined opaque, server-side CLI login sessions and kept the login token between the CLI and authority by having the CLI obtain its admission ticket directly.
+- 2026-11-04: Defined opaque, server-side CLI login sessions; kept CLI and browser login credentials between each client and the authority; and added a browser admission-ticket exchange for a host-only session-gateway cookie.
