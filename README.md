@@ -50,6 +50,7 @@ Run `scripts/validate-teps.py` locally before pushing. CI runs the same checks.
 | [0001](teps/0001-tep-process/README.md) | TEP process | implemented | @trevex |
 | [0002](teps/0002-architecture/README.md) | Architecture vision | draft | @trevex |
 | [0004](teps/0004-scope-and-assumptions/README.md) | Scope, assumptions and operator responsibilities | draft | @The127 |
+| [0005](teps/0005-gateway-sessions/README.md) | Gateway routing and session lifecycle | draft | @trevex |
 <!-- END TEP INDEX -->
 
 ## Contributing
