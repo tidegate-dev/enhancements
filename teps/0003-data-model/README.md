@@ -48,6 +48,8 @@ The model also has to separate administration of Tidegate from access through Ti
 - Asset connection details, credential configuration, and target identity pinning. These belong to the asset catalog and worker TEPs.
 - Identity provider protocols. This TEP assumes OIDC for examples but does not choose the supported set.
 - Implementing the organization as a resource, and multi-organization support. The organization is described so the model has room for it, but the first implementation stores no organization record or organization identifier, and the API does not expose one.
+- Requesting organization governance through AccessPolicy or creating OrgBindings from access requests. This can be added as a future feature but is not part of the MVP.
+- Requesting or granting a narrowed subset of a Role, and protocol-specific exclusions within an asset permission. The model leaves room for both, but their schemas and evaluation rules are future work.
 - Audit event formats.
 
 ## Proposal
@@ -130,6 +132,8 @@ Project recovery is an explicit OrgRole governance permission. It allows its hol
 
 An OrgBinding gives an OrgRole to a subject. The subject is a user or a shared group. Organization bindings can carry an expiry time like project bindings, described under [Bindings](#bindings).
 
+In the MVP, OrgBindings are created administratively. AccessPolicy and AccessRequest apply only to project Roles and Bindings; they cannot request an OrgRole or create an OrgBinding. Requestable, just-in-time organization governance may be added as a future feature.
+
 ### Projects
 
 A project is the boundary for assets and the rules that govern access to them. Each project holds its own assets, groups, roles, bindings, access policies, and access requests. A project role can select only assets in its own project, and a project binding grants roles only within its project.
@@ -151,6 +155,8 @@ By default a group is visible only within its project. A group marked as shared 
 
 Sharing lets an organization define a group such as `security-team` once, in a project that owns it, and reuse it everywhere. Only the owning project can change a shared group's membership, so other projects reference it but cannot alter it.
 
+This TEP uses `shared` as the model term. The future API TEP may choose a different field name when it defines the concrete Group schema.
+
 Every cross-project group reference names both the owning project and the group. A bare group name is resolved only within the current project, so shared groups with the same name in different projects remain unambiguous.
 
 A group can also carry an external reference to a group at an identity provider. A user who signs in through that IdP and presents the referenced group in their group claim becomes a member of the Tidegate group for as long as the claim says so. Tidegate never maps IdP groups implicitly: an IdP group named `admins` has no effect until some Tidegate group references it by provider and value. An external reference names the IdP as well as the group value, so a group claim from one provider cannot satisfy a reference meant for another.
@@ -165,7 +171,7 @@ An Asset is a project-scoped access definition for a target that Tidegate broker
 
 Different projects can define separate assets for the same underlying system or endpoint. Each definition is administered independently and can use different credentials or credential references, protocol settings, labels, roles, and access policies. Tidegate does not link those definitions or treat changes to one as changes to the others. This lets each project own its access path without depending on an organization administrator or another project.
 
-Assets carry labels: key-value pairs in the style of Kubernetes object labels, such as `env: prod` or `team: payments`. Labels are the only way roles select assets. Changing an asset's labels can therefore change who has access to it, so updating labels requires its own project-wide permission, described under [Project-wide permissions](#project-wide-permissions).
+Assets carry labels: key-value pairs in the style of Kubernetes object labels, such as `env: prod` or `team: payments`. Labels are the only way roles select assets. A project does not predeclare label keys or restrict assets to an allowed key set; assets may use any label accepted by the concrete label syntax chosen by the future API TEP. Changing an asset's labels can therefore change who has access to it, so updating labels requires its own project-wide permission, described under [Project-wide permissions](#project-wide-permissions).
 
 ### Role specifications and permissions
 
@@ -277,9 +283,13 @@ Just-in-time access is a temporary binding created through an approved request. 
 - An AccessRequest records one user's request for a role under a policy, with the requested duration and a justification.
 - A Binding with an expiry time is the result of an approved request.
 
+The MVP requests and grants the complete Role named by the AccessPolicy. This does not prevent a future extension that lets a request ask for a narrower grant. Such an extension can record additional constraints on the AccessRequest and resulting Binding, with effective access defined as the intersection of the referenced Role and the approved constraints. Constraints can remove access from the Role but can never add to it. A future TEP will define their representation and whether they capture a snapshot or are evaluated dynamically; no constraint fields are part of the MVP.
+
+AccessPolicy does not apply to OrgRole in the MVP. An approved request always creates a project Binding, never an OrgBinding.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending: user requests role under policy
+    [*] --> Pending: user requests project role under policy
     Pending --> Approved: required approvals reached
     Pending --> Denied: an approver denies
     Pending --> Cancelled: requester cancels
@@ -410,7 +420,7 @@ flowchart TB
     roles -->|"none"| deny
 ```
 
-The model has no deny rules. Access is the union of what all applicable bindings grant, which keeps the result independent of evaluation order and makes every grant traceable to a single binding. Organization roles do not take part in asset access checks.
+The MVP model has no deny rules. Access is the union of what all applicable bindings grant, which keeps the result independent of evaluation order and makes every grant traceable to a single binding. Organization roles do not take part in asset access checks.
 
 Checks for administrative actions follow the same subject and binding resolution, then evaluate the relevant typed project-wide or organization-governance field. Asset selectors do not participate in administrative checks.
 
@@ -420,7 +430,9 @@ Cross-project governance through an OrgRole follows the same rule but resolves O
 
 Whatever exact versioned schema the future API TEP chooses, the authority validates Role and OrgRole documents when they are written. Unknown permission fields, unknown protocol sections, invalid values, omitted asset selectors, and invalid field combinations are rejected rather than ignored.
 
-At evaluation time, the authority uses the behavior defined for the relevant typed field. For example, the SSH worker TEP defines how a role expresses permitted accounts, while the Kubernetes worker TEP defines how a role expresses groups or users to impersonate. There is no common wildcard or string-matching language across these schemas. Broad grants and protocol-specific exclusions, where needed, must be explicit parts of the relevant typed spec.
+At evaluation time, the authority uses the behavior defined for the relevant typed field. For example, the SSH worker TEP defines how a role expresses permitted accounts, while the Kubernetes worker TEP defines how a role expresses groups or users to impersonate. There is no common wildcard or string-matching language across these schemas.
+
+Protocol-specific exclusions are not part of the MVP. When added, they must be declared explicitly in the Role spec as part of the relevant typed protocol permission, following the role-local precedent of Teleport's [`allow` and `deny` conditions](https://goteleport.com/docs/reference/access-controls/roles/). An exclusion narrows that protocol permission; it is not a generic deny rule that overrides grants from other bindings. The worker TEP for the protocol and a future data-model update will define the concrete fields, enforcement point, and combination behavior.
 
 ### Group membership from identity providers
 
@@ -483,16 +495,11 @@ A single level of roles, where organization administration is expressed as field
 
 Implicit mapping of IdP groups to Tidegate groups by name would remove a configuration step. It would also let anyone who can create groups at the IdP grant themselves membership in any Tidegate group with the same name.
 
-Deny rules would allow carving exceptions out of broad roles. They make the result of an access check depend on the interaction of several rules, which works against explaining access through a single binding.
+Deny rules that override grants from other bindings would allow carving exceptions out of broad roles. They make the result of an access check depend on the interaction of several independent rules, which works against explaining access through a single binding. This does not preclude a future typed, protocol-specific exclusion that locally narrows one permission in a Role.
 
 ## Unresolved questions
 
-- What should the "shared" flag be called? Meetings used both "shared" and "exported", and an early bootstrap draft used `extern`. This TEP uses `shared`.
-- Can org bindings be requested through access policies, so that organization administration is also just-in-time? This TEP allows org bindings with an expiry time but defines access policies only for project roles.
 - Should an asset access rule be able to delegate management of the assets it selects, for example letting a team edit only assets labeled with its own team name? Project-wide permissions are deliberately not narrowed by asset selectors.
-- Should access requests be able to ask for less than a whole role, for example one asset of the role's selection, as jumpgate grants were bound to a single asset?
-- Should labels be limited to a defined key set per project, to keep label conventions consistent?
-- How are protocol-specific exclusions expressed? Some protocols need a broad grant with exceptions, for example impersonating `cluster-admin` in a Kubernetes cluster while the proxy blocks requests to the `kube-system` namespace. Such exclusions would be represented in that protocol's typed spec and enforced by the worker inside a session. This differs from the deny rules rejected under [Alternatives](#alternatives): an exclusion narrows one permission instead of overriding grants from other bindings. The open questions are where exclusions are declared, how they combine when several bindings apply, and which workers can enforce them.
 
 ## Implementation history
 
