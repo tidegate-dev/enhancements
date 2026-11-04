@@ -38,12 +38,12 @@ The model also has to separate administration of Tidegate from access through Ti
 - Define how group membership is derived from identity provider claims, and keep that mapping explicit.
 - Define the lifecycle of just-in-time access, from policy to request, approval, time-limited binding, and revocation.
 - Define the rules that prevent a user from granting more access than they hold.
-- Define a declarative resource format that can bootstrap a new instance.
+- Illustrate how declarative resource documents can represent the model and bootstrap a new instance, without standardizing an API or wire format.
 - Avoid choices that would block hosting multiple organizations in one instance as a future feature.
 
 ### Non-goals
 
-- Database schemas, API definitions, and wire formats. A future TEP might define them.
+- Database schemas, API definitions, wire formats, and a final declarative configuration schema. A future TEP defines exact field names and casing, resource versioning and metadata, serialization-specific defaulting and validation, and create, update, and apply semantics.
 - The complete schema of protocol-specific asset permissions. Each worker TEP defines the typed fields and matching behavior for its protocol.
 - Asset connection details, credential configuration, and target identity pinning. These belong to the asset catalog and worker TEPs.
 - Identity provider protocols. This TEP assumes OIDC for examples but does not choose the supported set.
@@ -88,12 +88,12 @@ erDiagram
 | Organization | Instance | Cluster | Top-level tenant. Implicit for now: one per instance, not stored and not exposed in the API. |
 | IdentityProvider | Organization | none | Configuration for an external identity provider, such as an OIDC issuer. |
 | User | Organization | User | A person or service account that can sign in. |
-| OrgRole | Organization | ClusterRole | Schema-validated organization and cross-project governance permissions. Never grants asset access. |
+| OrgRole | Organization | ClusterRole | Well-defined organization and cross-project governance permissions. Never grants asset access. |
 | OrgBinding | Organization | ClusterRoleBinding | Gives an OrgRole to a user or a shared group. |
 | Project | Organization | Namespace | Boundary for assets and the access rules that apply to them. |
 | Group | Project | none | A set of users and other groups. Optionally shared with other projects, optionally mapped to an IdP group. |
 | Asset | Project | none | One project's access definition for a target, including how Tidegate identifies and connects to it. Carries labels. |
-| Role | Project | Role | Schema-validated asset access rules and project-wide governance permissions. |
+| Role | Project | Role | Well-defined asset access rules and project-wide governance permissions. |
 | Binding | Project | RoleBinding | Gives a Role to a user or group, permanently or until an expiry time. |
 | AccessPolicy | Project | none | Says who may request a Role, who approves, and for how long. |
 | AccessRequest | Project | none | A user's request for a Role under an AccessPolicy. |
@@ -102,7 +102,7 @@ erDiagram
 
 An organization is the tenant boundary. Users, identity providers, organization roles and bindings, and projects belong to one organization, and no reference crosses from one organization to another.
 
-The organization is part of the model but will not be implemented for now. A Tidegate instance serves exactly one organization, and that organization is the instance itself. The authority stores no organization record and no organization identifier on other records, and neither the API nor the declarative format names an organization. Organization-level resources are therefore unique across the instance.
+The organization is part of the model but will not be implemented for now. A Tidegate instance serves exactly one organization, and that organization is the instance itself. The authority stores no organization record and no organization identifier on other records, and no interface or bootstrap document needs to name an organization. Organization-level resources are therefore unique across the instance.
 
 Hosting several organizations in one instance is a possible future feature. It would make the organization an explicit resource and require a migration that assigns existing records to a default organization and scopes names and queries by it. This TEP avoids choices that would make that harder: no reference relies on there being only one organization in a way that a default organization could not satisfy.
 
@@ -118,7 +118,9 @@ The authority stores local passwords only as self-describing password-hash strin
 
 ### Organization roles and bindings
 
-An OrgRole has a schema-validated spec that describes governance permissions. Organization-level permissions cover operations such as managing users, configuring identity providers, creating and listing projects, managing organization roles and bindings, and reading the audit log. Cross-project governance permissions may authorize specific administrative operations on project resources, such as editing groups or access policies.
+An OrgRole has a well-defined spec that describes governance permissions. Organization-level permissions cover operations such as managing users, configuring identity providers, creating and listing projects, managing organization roles and bindings, and reading the audit log. Cross-project governance permissions may authorize specific administrative operations on project resources, such as editing groups or access policies.
+
+Conceptually, the spec separates `organization` permissions from `project` permissions. The `project` subtree uses the same permission structure as the `project` subtree of a Role. On a Role it applies only to that Role's project; on an OrgRole it applies across all projects. An OrgRole has no asset-access subtree, so its schema cannot express asset access.
 
 The initial model has no project selector on an OrgRole. A cross-project governance permission therefore applies to every project. Organizations that need administration limited to one project use a Role and Binding in that project. More granular OrgRole fields can be added when concrete user needs justify them.
 
@@ -167,32 +169,97 @@ Assets carry labels: key-value pairs in the style of Kubernetes object labels, s
 
 ### Role specifications and permissions
 
-A Role has a schema-validated spec with two independent concerns:
+A Role has a well-defined spec with two independent concerns:
 
-- Asset access rules associate a label selector with typed, protocol-specific permissions. A matching rule applies only to assets in the role's project. A rule without a selector applies to every asset in that project, including assets added later.
+- Asset access rules associate a required label selector with typed, protocol-specific permissions. A matching rule applies only to assets in the role's project. An explicitly empty selector matches every asset in that project, including assets added later; omitting the selector is invalid.
 - Project-wide permissions govern project resources such as groups, roles, bindings, access policies, assets, and asset labels. Asset selectors do not narrow these permissions.
 
-Role and OrgRole specs do not contain generic strings such as `project:role:edit` or `{scope, action, qualifier}` triples. Their allowed fields, values, and authorization behavior are defined by their schemas. Unknown fields and invalid combinations are rejected. Each worker TEP adds the typed asset permissions for its protocol, such as the SSH accounts or Kubernetes groups a matching rule permits.
+Role and OrgRole specs do not contain generic strings such as `project:role:edit` or `{scope, action, qualifier}` triples. Their allowed fields, values, and authorization behavior are well-defined. Each worker TEP defines the typed asset permissions for its protocol, such as the SSH accounts or Kubernetes groups a matching rule permits. A future API TEP turns this conceptual structure into versioned schemas and defines how unknown fields and invalid combinations are rejected.
 
-The following example illustrates the intended shape, not final field names. It gives holders the Kubernetes `editor` group on matching assets and lets them edit access policies throughout the project:
+The conceptual Role shape has an unordered, additive list of asset rules and a separate project-governance subtree. The following YAML illustrates that shape; it does not settle final field names:
 
 ```yaml
 kind: Role
-name: admin
-project: myproject
+name: production-operator
+project: payments
 spec:
-  matches:
-    - labelSelector: ...
-      kubernetesGroup: editor
-  projectWide:
-    policyEditor: true
+  assets:
+    - selector:
+        matchLabels:
+          environment: production
+        matchExpressions:
+          - key: tier
+            operator: In
+            values: [backend, database]
+      permissions:
+        ssh:
+          accounts: [deploy]
+        kubernetes:
+          groups: [editor]
+
+    - selector: {} # Explicitly matches every asset in this project.
+      permissions:
+        postgres:
+          roles: [readonly]
+
+  project:
+    roles:
+      read: true
+      create: true
+      update: true
+      delete: true
+      bind: true
+      escalate: false
+    policies:
+      read: true
+      create: true
+      update: true
+      delete: true
 ```
 
-The detailed schemas will be developed from concrete user needs. Later TEPs may change names such as `matches`, `kubernetesGroup`, and `projectWide` before the API becomes stable, but they must preserve the separation between typed asset permissions and typed governance permissions.
+Each `assets` entry combines one selector with one or more protocol-specific permission objects. Entries are order-independent. If several entries match an asset, their permissions are unioned; no entry overrides another. Selectors follow the Kubernetes [`LabelSelector`](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#resources-that-support-set-based-requirements) model of `matchLabels` and `matchExpressions`. Requirements inside one selector are ANDed. Multiple asset entries provide OR behavior. Requiring the selector field makes broad access explicit: `selector: {}` means all assets, while an omitted selector is rejected.
+
+The project subtree uses typed boolean actions rather than free-form verbs. The eventual schema may refine the resource and action names, but it preserves this nesting and gives security-sensitive operations such as binding and escalating roles their own fields. The standard project-administrator Role enables the required project-governance and delegation fields but has no `assets` entries.
+
+An OrgRole reuses the same project-governance structure and adds organization governance. This example is also illustrative:
+
+```yaml
+kind: OrgRole
+name: organization-admin
+spec:
+  organization:
+    users:
+      read: true
+      create: true
+      update: true
+      delete: true
+    identityProviders:
+      read: true
+      create: true
+      update: true
+      delete: true
+    projects:
+      list: true
+      create: true
+      delete: true
+      recover: true
+
+  project:
+    groups:
+      read: true
+      create: true
+      update: true
+      delete: true
+    policies:
+      read: true
+      create: true
+      update: true
+      delete: true
+```
 
 #### Project-wide permissions
 
-Project-wide permissions describe who may create and change groups, roles, bindings, access policies, and assets, and who may change asset labels. They are explicit fields in the Role spec rather than encoded strings. A role may contain both asset access rules and project-wide permissions; the authority evaluates each part independently, so a label selector never appears to restrict a project-wide permission.
+Project-wide permissions describe who may read, create, and change groups, roles, bindings, access policies, and assets, and who may change asset labels. They are explicit fields in the `project` subtree rather than encoded strings. A Role may contain both asset access rules and project-wide permissions; the authority evaluates each part independently, so an asset selector never appears to restrict a project-wide permission.
 
 ### Bindings
 
@@ -237,15 +304,15 @@ The authority enforces these rules:
 
 ### Who can grant access
 
-Creating a binding or an access policy hands out the permissions of a role, so the authority checks two things. The creator must hold the project-wide permission to create bindings or policies. The creator must also be entitled to everything the role grants: either they hold every effective permission represented by the role's typed spec, on every asset its rules currently select, or their own spec explicitly permits binding that role. This mirrors the escalation check in Kubernetes RBAC, where creating a RoleBinding requires holding the role's permissions or the `bind` verb on it.
+Creating a binding or an access policy hands out the permissions of a role, so the authority checks two things. The creator must hold the project-wide permission to create bindings or policies. The creator must also be entitled to everything the role grants: either they hold every effective permission represented by the role's typed spec, on every asset its rules currently select, or their project permissions explicitly allow binding roles. This mirrors the escalation check in Kubernetes RBAC, where binding a role requires holding its permissions or explicit [`bind` permission](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#restrictions-on-role-binding-creation-or-update).
 
-The same rule applies to roles. Creating or changing a role requires the corresponding project-wide permission, and the new or changed role cannot grant asset or governance permissions the author is not entitled to delegate. Without this rule, a user allowed to edit roles could widen a role they are already bound to. The concrete Role schema defines the explicit fields for binding or delegating permissions; they are not magic capability strings.
+The same rule applies to roles. Creating or changing a role requires the corresponding project-wide permission, and the new or changed role cannot grant asset or governance permissions the author is not entitled to delegate unless their project permissions explicitly allow escalation. Without this rule, a user allowed to edit roles could widen a role they are already bound to. The conceptual `bind` and `escalate` fields mirror Kubernetes' separate privilege-escalation controls; the future API TEP defines their final representation.
 
-### Declarative configuration
+### Illustrative declarative configuration
 
-Every resource has the same shape: a `kind`, a `name`, a `project` for project-level resources, and a `spec`. The authenticated CLI can apply resources in this shape during normal operation.
+The examples in this TEP use a common document shape with `kind`, `name`, an optional `project`, and `spec` because it makes resource relationships and bootstrap behavior concrete. This shape is illustrative, not an API or configuration specification. A later TEP decides whether the real format uses these fields or Kubernetes-style `apiVersion`, `kind`, and `metadata`; it also defines casing, versioning, serialization-specific defaulting and validation, and authenticated create, update, and apply behavior.
 
-A new instance can accept a bootstrap file in the same format exactly once. The authority validates and applies the complete file in one transaction and records successful initialization in that transaction. If validation or application fails, the transaction is rolled back, the instance remains uninitialized, and the operator can retry. After either bootstrap or interactive initial-administrator creation succeeds, the authority rejects all later bootstrap input; later configuration changes use the authenticated API or CLI and their normal authorization checks.
+The bootstrap lifecycle is a decision of this TEP even though its serialization is not. A new instance can accept one set of declarative bootstrap documents exactly once. The authority validates and applies the complete set in one transaction and records successful initialization in that transaction. If validation or application fails, the transaction is rolled back, the instance remains uninitialized, and the operator can retry. After either bootstrap or interactive initial-administrator creation succeeds, the authority rejects all later bootstrap input; later configuration changes use the authenticated API or CLI behavior defined by the future API TEP.
 
 As an alternative to a bootstrap file, an operator can run `authority create-initial-admin` against an uninitialized instance with no User records. The command interactively creates the initial User, enrolls a password and second factor, creates the superadmin OrgRole if needed, creates its OrgBinding, and marks the instance initialized in one transaction. It reads the password interactively, hashes it inside the authority, and never accepts it in a command-line argument or writes it to logs.
 
@@ -267,21 +334,7 @@ spec:
 ---
 kind: OrgRole
 name: superadmin
-spec:
-  # Illustrative typed governance fields; the exact schema is defined separately.
-  users:
-    editor: true
-  identityProviders:
-    editor: true
-  projects:
-    creator: true
-    reader: true
-    recoverer: true
-  projectResources:
-    groups:
-      editor: true
-    policies:
-      editor: true
+spec: { ... } # Typed governance permissions are abbreviated here.
 ---
 kind: Project
 name: system
@@ -333,7 +386,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 - Shared groups widen the impact of a membership change. Adding a user to a shared group can grant access in projects the group owner never looks at. Only the owning project can change membership, and the audit record of a membership change lists where the group is referenced.
 - IdP-derived membership can be stale. A user removed from an IdP group keeps the Tidegate membership until their claims are refreshed. Claims are refreshed on every sign-in and token refresh, and the session lifetime bounds how long stale membership can last.
 - Break-glass accounts bypass the IdP and its offboarding process. Local login has its own mandatory second factor, is opt-in per user, and produces a distinct audit event. The number of such accounts is expected to be small and operators must manage their lifecycle explicitly.
-- An asset access rule without a selector applies to every asset in the project, including assets added later. The API and UI show such rules as matching all project assets, and the escalation check treats their typed permissions accordingly.
+- An asset access rule with `selector: {}` applies to every asset in the project, including assets added later. The API and UI show such rules as matching all project assets, and the escalation check treats their typed permissions accordingly. Omitting the required selector is rejected instead of silently broadening access.
 
 ## Design details
 
@@ -346,7 +399,7 @@ flowchart TB
     start(["user, asset, requested protocol operation"])
     subjects["Resolve the user's subjects:<br>the user, plus every group they belong to,<br>directly, through nesting, or through IdP claims"]
     bindings["Find bindings in the asset's project<br>whose subject is in that set<br>and that have not expired"]
-    roles["Find asset access rules whose<br>label selector matches the asset,<br>or that have no selector"]
+    roles["Find asset access rules whose<br>required label selector matches the asset;<br>an empty selector explicitly matches all"]
     permissions["Evaluate the requested operation<br>against the rule's typed permissions"]
     allow(["allow"])
     deny(["deny"])
@@ -365,7 +418,7 @@ Cross-project governance through an OrgRole follows the same rule but resolves O
 
 ### Permission matching and validation
 
-The authority validates Role and OrgRole specs against the schema for their resource and API version when they are written. Unknown permission fields, unknown protocol sections, invalid values, and invalid field combinations are rejected rather than ignored.
+Whatever exact versioned schema the future API TEP chooses, the authority validates Role and OrgRole documents when they are written. Unknown permission fields, unknown protocol sections, invalid values, omitted asset selectors, and invalid field combinations are rejected rather than ignored.
 
 At evaluation time, the authority uses the behavior defined for the relevant typed field. For example, the SSH worker TEP defines how a role expresses permitted accounts, while the Kubernetes worker TEP defines how a role expresses groups or users to impersonate. There is no common wildcard or string-matching language across these schemas. Broad grants and protocol-specific exclusions, where needed, must be explicit parts of the relevant typed spec.
 
@@ -377,7 +430,7 @@ A user who signs in with a local password has no IdP claims, so they belong only
 
 ### Names and references
 
-Organization-level resources have names unique within the organization for their kind. Project-level resources have names unique within their project for their kind. A reference to a project-level resource from another project, such as a shared group, names both the project and the resource. References are resolved by name in the declarative format and stored by immutable identifier in the database, so renaming a resource does not break references to it.
+Organization-level resources have names unique within the organization for their kind. Project-level resources have names unique within their project for their kind. A reference to a project-level resource from another project, such as a shared group, names both the project and the resource. The illustrative declarative documents resolve references by name; the implementation stores immutable identifiers so renaming a resource does not break references to it. The future API TEP defines the exact reference representation.
 
 ## Security considerations
 
@@ -394,7 +447,7 @@ Tidegate has no released version, so this TEP has no compatibility impact. The a
 
 ## Test plan
 
-This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, tests that project creation atomically establishes its initial administrator, tests that project recovery can bind only the standard administrator role, and tests that self-approval and approval through temporary bindings are rejected. Initialization tests cover transactional bootstrap, retry after rollback, rejection after successful initialization, the initial-administrator command's guards, PHC string validation and minimum parameters, rejection of plaintext passwords, and mandatory second-factor enrollment for local login.
+This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, additive and order-independent asset rules, required selectors and explicit empty selectors, negative authorization tests for every escalation rule in this TEP, tests that project creation atomically establishes its initial administrator, tests that project recovery can bind only the standard administrator role, and tests that self-approval and approval through temporary bindings are rejected. Initialization tests cover transactional bootstrap, retry after rollback, rejection after successful initialization, the initial-administrator command's guards, PHC string validation and minimum parameters, rejection of plaintext passwords, and mandatory second-factor enrollment for local login.
 
 ## Rollout
 
@@ -404,12 +457,13 @@ The model is implemented together with the authority. A likely order:
 2. Groups, nesting, and shared groups.
 3. Identity providers and external group references.
 4. Access policies, access requests, and temporary bindings.
-5. Declarative bootstrap and `apply` in the CLI.
+5. Declarative bootstrap loading and authenticated configuration tooling.
 
 ## Drawbacks
 
 - Two levels of roles and bindings mean two places to look when answering "who can do what". The split is deliberate, but tooling has to show both.
 - Cross-project governance permissions are broad because the initial OrgRole model has no project selector. Sensitive permissions, especially project recovery, require careful assignment and prominent auditing.
+- Typed permission trees are more verbose than generic resource-and-verb rules, and adding a new governance operation requires evolving the corresponding schema. The extra structure makes permissions discoverable and prevents unvalidated strings from silently acquiring meaning.
 - Labels are flat. Organizations used to a folder hierarchy, as in jumpgate, have to express their structure through label conventions.
 - Projects that access the same underlying system duplicate some asset configuration and must coordinate target changes outside Tidegate.
 - Shared groups create dependencies between projects that are not visible from the referencing side without tooling.
@@ -422,6 +476,8 @@ A folder hierarchy with inherited roles, as in jumpgate, models organizational s
 Storing an organization identifier on every record now, with a single organization created at bootstrap, would make multi-organization support a smaller change later. It would also add a column, a scope on every query and uniqueness constraint, and a code path that nothing exercises until the feature exists. The maintainers prefer to pay for a migration if and when multi-organization support is built.
 
 Making an asset an organization-level resource that can belong to several projects would avoid duplicate endpoint configuration. It would also require organization-wide ownership or a separate sharing and binding model, make project administrators depend on another owner for asset changes, and complicate projects that need different credentials or levels of control over the same target. The initial model instead keeps each Asset in exactly one project. More advanced sharing can be added later if concrete use cases outweigh that administrative cost.
+
+Using Kubernetes `PolicyRule` objects directly, with generic resource and verb strings, would make governance permissions compact and easy to extend. It would also reintroduce the stringly capability model this TEP rejects and would not naturally express protocol-specific asset access such as SSH accounts or Kubernetes impersonation groups. Tidegate instead borrows Kubernetes' additive rule lists, label selectors, and explicit `bind` and `escalate` controls while keeping permission fields typed.
 
 A single level of roles, where organization administration is expressed as fields in the Role spec of some special project, would remove the OrgRole and OrgBinding kinds. It would also let a project administrator of that special project gain organization rights, and it would mix governance and access in one evaluation path.
 
@@ -440,5 +496,5 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 
 ## Implementation history
 
-- 2026-11-04: Incorporated maintainer meeting decisions: authority terminology, typed Role and OrgRole specs, project administration and recovery, project-qualified shared-group references, project-owned assets, and one-time bootstrap with MFA-protected local login.
+- 2026-11-04: Incorporated maintainer meeting decisions: authority terminology, typed Role and OrgRole specs, project administration and recovery, project-qualified shared-group references, project-owned assets, illustrative declarative configuration, and one-time bootstrap with MFA-protected local login.
 - 2026-10-02: First draft, based on the model agreed in several maintainer meetings.
