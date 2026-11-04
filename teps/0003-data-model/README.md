@@ -19,7 +19,7 @@ superseded-by: []
 
 This TEP defines the resources the Tidegate authority stores and the rules it uses to decide who may do what. It is a starting model agreed over several maintainer meetings, and later TEPs are expected to refine it.
 
-The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates and recovers projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role uses label selectors and typed, protocol-specific permissions to describe access, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
+The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates and recovers projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. An asset is one project's access definition for a target. Assets carry labels, and a project role uses label selectors and typed, protocol-specific permissions to describe access, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
 
 The model borrows its shape from Kubernetes RBAC. An organization role works like a ClusterRole, a project works like a namespace, and a project role works like a Role.
 
@@ -92,7 +92,7 @@ erDiagram
 | OrgBinding | Organization | ClusterRoleBinding | Gives an OrgRole to a user or a shared group. |
 | Project | Organization | Namespace | Boundary for assets and the access rules that apply to them. |
 | Group | Project | none | A set of users and other groups. Optionally shared with other projects, optionally mapped to an IdP group. |
-| Asset | Project | none | A target that Tidegate brokers access to, such as an SSH host, a database, or a cluster. Carries labels. |
+| Asset | Project | none | One project's access definition for a target, including how Tidegate identifies and connects to it. Carries labels. |
 | Role | Project | Role | Schema-validated asset access rules and project-wide governance permissions. |
 | Binding | Project | RoleBinding | Gives a Role to a user or group, permanently or until an expiry time. |
 | AccessPolicy | Project | none | Says who may request a Role, who approves, and for how long. |
@@ -157,7 +157,9 @@ A group can combine an external reference with explicitly listed members. Member
 
 ### Assets and labels
 
-An Asset is a target that Tidegate brokers access to: an SSH host, a Windows host, a database, a Kubernetes cluster, or another kind supported by a worker. Every asset belongs to one project and has a kind, a name unique within its project, and kind-specific configuration defined by the asset catalog and worker TEPs.
+An Asset is a project-scoped access definition for a target that Tidegate brokers access to, such as an SSH host, a Windows host, a database, a Kubernetes cluster, or another kind supported by a worker. It describes how Tidegate identifies and connects to that target; it is not a globally unique record of the underlying machine, database, or cluster. Every asset belongs to exactly one project and has a kind, a name unique within its project, and kind-specific configuration defined by the asset catalog and worker TEPs.
+
+Different projects can define separate assets for the same underlying system or endpoint. Each definition is administered independently and can use different credentials or credential references, protocol settings, labels, roles, and access policies. Tidegate does not link those definitions or treat changes to one as changes to the others. This lets each project own its access path without depending on an organization administrator or another project.
 
 Assets carry labels: key-value pairs in the style of Kubernetes object labels, such as `env: prod` or `team: payments`. Labels are the only way roles select assets. Changing an asset's labels can therefore change who has access to it, so updating labels requires its own project-wide permission, described under [Project-wide permissions](#project-wide-permissions).
 
@@ -316,6 +318,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 ### Risks and mitigations
 
 - Label changes change access. Adding `env: prod` to an asset makes every asset rule that selects `env: prod` applicable to it. Changing labels requires a dedicated project-wide permission, label changes are audited, and the access check always evaluates current labels so the effect is immediate and visible.
+- Separate assets can reach the same underlying system. Revoking or changing one project's asset does not affect another project's definition for the same endpoint. Operators must update each definition when a shared target changes, and audit records identify the project and asset used for each session.
 - Shared groups widen the impact of a membership change. Adding a user to a shared group can grant access in projects the group owner never looks at. Only the owning project can change membership, and the audit record of a membership change lists where the group is referenced.
 - IdP-derived membership can be stale. A user removed from an IdP group keeps the Tidegate membership until their claims are refreshed. Claims are refreshed on every sign-in and token refresh, and the session lifetime bounds how long stale membership can last.
 - Break-glass accounts bypass the IdP, including its MFA and offboarding. Local login is opt-in per user, every local login is a distinct audit event, and the number of such accounts is expected to be small.
@@ -397,6 +400,7 @@ The model is implemented together with the authority. A likely order:
 - Two levels of roles and bindings mean two places to look when answering "who can do what". The split is deliberate, but tooling has to show both.
 - Cross-project governance permissions are broad because the initial OrgRole model has no project selector. Sensitive permissions, especially project recovery, require careful assignment and prominent auditing.
 - Labels are flat. Organizations used to a folder hierarchy, as in jumpgate, have to express their structure through label conventions.
+- Projects that access the same underlying system duplicate some asset configuration and must coordinate target changes outside Tidegate.
 - Shared groups create dependencies between projects that are not visible from the referencing side without tooling.
 - Without deny rules, removing access for one asset from a broad role means narrowing the role's selector or splitting the role.
 
@@ -405,6 +409,8 @@ The model is implemented together with the authority. A likely order:
 A folder hierarchy with inherited roles, as in jumpgate, models organizational structure directly. Inheritance through rewrite rules made access hard to explain and hard to audit, which the maintainers consider a worse problem for a PAM system than the extra label conventions a flat model needs.
 
 Storing an organization identifier on every record now, with a single organization created at bootstrap, would make multi-organization support a smaller change later. It would also add a column, a scope on every query and uniqueness constraint, and a code path that nothing exercises until the feature exists. The maintainers prefer to pay for a migration if and when multi-organization support is built.
+
+Making an asset an organization-level resource that can belong to several projects would avoid duplicate endpoint configuration. It would also require organization-wide ownership or a separate sharing and binding model, make project administrators depend on another owner for asset changes, and complicate projects that need different credentials or levels of control over the same target. The initial model instead keeps each Asset in exactly one project. More advanced sharing can be added later if concrete use cases outweigh that administrative cost.
 
 A single level of roles, where organization administration is expressed as fields in the Role spec of some special project, would remove the OrgRole and OrgBinding kinds. It would also let a project administrator of that special project gain organization rights, and it would mix governance and access in one evaluation path.
 
