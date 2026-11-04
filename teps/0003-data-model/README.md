@@ -17,7 +17,7 @@ superseded-by: []
 
 ## Summary
 
-This TEP defines the resources the Tidegate control plane stores and the rules it uses to decide who may do what. It is a starting model agreed over several maintainer meetings, and later TEPs are expected to refine it.
+This TEP defines the resources the Tidegate authority stores and the rules it uses to decide who may do what. It is a starting model agreed over several maintainer meetings, and later TEPs are expected to refine it.
 
 The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role selects assets by label and grants capabilities on them, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
 
@@ -25,7 +25,7 @@ The model borrows its shape from Kubernetes RBAC. An organization role works lik
 
 ## Motivation
 
-Every component described in [TEP-0002](../0002-architecture/README.md) depends on the control plane's data model. The API, the CLI, the web UI, the access request flow, and the authorization checks made on behalf of gateways and workers all need the same vocabulary. Agreeing on it before the API TEPs start keeps those TEPs from inventing incompatible versions of the same concepts.
+Every component described in [TEP-0002](../0002-architecture/README.md) depends on the authority's data model. The API, the CLI, the web UI, the access request flow, and the authorization checks made on behalf of gateways and workers all need the same vocabulary. Agreeing on it before the API TEPs start keeps those TEPs from inventing incompatible versions of the same concepts.
 
 Jumpgate, Tidegate's predecessor, organized assets in a folder tree and let roles cascade down folders through rewrite rules. That model is expressive, but access depends on where an asset sits in the tree and on which rules a role carries, which makes it hard to see why someone has access. The maintainers want a flatter model in which access follows from a short chain of explicit records: a binding, a role, a label selector, and a capability. Labels also suit assets that are discovered or managed by automation, because tooling can set labels without placing assets in a hierarchy.
 
@@ -33,7 +33,7 @@ The model also has to separate administration of Tidegate from access through Ti
 
 ### Goals
 
-- Define the resources the control plane stores, their scope (organization or project), and how they reference each other.
+- Define the resources the authority stores, their scope (organization or project), and how they reference each other.
 - Define how an access decision is evaluated, from a user's identity to a capability on an asset.
 - Define how group membership is derived from identity provider claims, and keep that mapping explicit.
 - Define the lifecycle of just-in-time access, from policy to request, approval, time-limited binding, and revocation.
@@ -102,7 +102,7 @@ erDiagram
 
 An organization is the tenant boundary. Users, identity providers, organization roles and bindings, and projects belong to one organization, and no reference crosses from one organization to another.
 
-The organization is part of the model but will not be implemented for now. A Tidegate instance serves exactly one organization, and that organization is the instance itself. The control plane stores no organization record and no organization identifier on other records, and neither the API nor the declarative format names an organization. Organization-level resources are therefore unique across the instance.
+The organization is part of the model but will not be implemented for now. A Tidegate instance serves exactly one organization, and that organization is the instance itself. The authority stores no organization record and no organization identifier on other records, and neither the API nor the declarative format names an organization. Organization-level resources are therefore unique across the instance.
 
 Hosting several organizations in one instance is a possible future feature. It would make the organization an explicit resource and require a migration that assigns existing records to a default organization and scopes names and queries by it. This TEP avoids choices that would make that harder: no reference relies on there being only one organization in a way that a default organization could not satisfy.
 
@@ -112,7 +112,7 @@ An IdentityProvider resource configures an external identity source, for example
 
 A User is an organization-level identity. Users are referenced by name across all projects, so the same person has one user record no matter how many projects they work in. A user can be linked to one or more external identities, each identified by the provider and the subject the provider asserts. A user who signs in through an IdP for the first time gets a user record created and linked automatically. Signing in never links a new external identity to an existing user by matching email addresses, because an attacker who controls an email address at one provider could otherwise take over an account created through another.
 
-Some users also need a local password. When the IdP is down or misconfigured, administrators must still be able to sign in and repair the instance. A user marked for local login can authenticate with a password stored as a salted hash in the control plane, independent of any IdP. Local login is opt-in per user, intended for a small number of break-glass accounts, and every local login is recorded as a distinct audit event so it can trigger alerts. Whether local login also requires a second factor is an open question.
+Some users also need a local password. When the IdP is down or misconfigured, administrators must still be able to sign in and repair the instance. A user marked for local login can authenticate with a password stored as a salted hash in the authority, independent of any IdP. Local login is opt-in per user, intended for a small number of break-glass accounts, and every local login is recorded as a distinct audit event so it can trigger alerts. Whether local login also requires a second factor is an open question.
 
 ### Organization roles and bindings
 
@@ -130,7 +130,7 @@ Projects let teams own their part of the asset inventory. A team that owns a pro
 
 ### Groups
 
-A Group is a set of members, and each member is a user or another group. Groups belong to a project. Nesting is allowed, so a `db-oncall` group can include a `platform-oncall` group. The control plane rejects any change that would create a membership cycle.
+A Group is a set of members, and each member is a user or another group. Groups belong to a project. Nesting is allowed, so a `db-oncall` group can include a `platform-oncall` group. The authority rejects any change that would create a membership cycle.
 
 By default a group is visible only within its project. A group marked as shared can also be referenced from outside its project:
 
@@ -169,13 +169,13 @@ For example, a role with the capability `scope: ssh, action: login, qualifier: r
 
 Project capabilities govern the project itself: who may create and change groups, roles, bindings, access policies, and assets, and who may change asset labels. They use resource types as their scope, for example `scope: bindings, action: create`.
 
-Project capabilities only take effect in a role without a selector. A label selector chooses assets, and creating a group or a role is not an action on an asset, so a project capability inside a selected role has nothing to apply to. The control plane rejects roles that combine a selector with project capabilities, so an author cannot write a role that looks more powerful than it is.
+Project capabilities only take effect in a role without a selector. A label selector chooses assets, and creating a group or a role is not an action on an asset, so a project capability inside a selected role has nothing to apply to. The authority rejects roles that combine a selector with project capabilities, so an author cannot write a role that looks more powerful than it is.
 
 ### Bindings
 
 A Binding gives a Role to a subject within a project. The subject is a user, a group in the same project, or a shared group from another project.
 
-A binding without an expiry time is standing access. It lasts until someone deletes it. A binding with an expiry time is temporary access, and the control plane removes it when it expires. Temporary bindings are usually created by an approved access request, described below, and record the request that created them. An administrator with the right capability can also create a temporary binding directly, for example to grant access during a planned maintenance window.
+A binding without an expiry time is standing access. It lasts until someone deletes it. A binding with an expiry time is temporary access, and the authority removes it when it expires. Temporary bindings are usually created by an approved access request, described below, and record the request that created them. An administrator with the right capability can also create a temporary binding directly, for example to grant access during a planned maintenance window.
 
 When a binding expires or is deleted, live sessions that depend on it end, as described under continuous revocation in [TEP-0002](../0002-architecture/README.md#continuous-revocation).
 
@@ -204,7 +204,7 @@ stateDiagram-v2
     Revoked --> [*]
 ```
 
-The control plane enforces these rules:
+The authority enforces these rules:
 
 - A requester can never approve their own request, even when they belong to the approver group. If the approvers named by a policy contain no one other than the requester, the request cannot be approved.
 - A single denial ends the request.
@@ -214,7 +214,7 @@ The control plane enforces these rules:
 
 ### Who can grant access
 
-Creating a binding or an access policy hands out the capabilities of a role, so the control plane checks two things. The creator must hold the project capability to create bindings or policies. The creator must also be entitled to the role being granted: either they hold every capability the role grants, on every asset the role currently selects, or they hold an explicit `bind` capability on that role. This mirrors the escalation check in Kubernetes RBAC, where creating a RoleBinding requires holding the role's permissions or the `bind` verb on it.
+Creating a binding or an access policy hands out the capabilities of a role, so the authority checks two things. The creator must hold the project capability to create bindings or policies. The creator must also be entitled to the role being granted: either they hold every capability the role grants, on every asset the role currently selects, or they hold an explicit `bind` capability on that role. This mirrors the escalation check in Kubernetes RBAC, where creating a RoleBinding requires holding the role's permissions or the `bind` verb on it.
 
 The same rule applies to roles. Creating or changing a role requires the project capability to manage roles, and the new or changed role cannot grant capabilities on assets the author could not grant themselves. Without this rule, a user allowed to edit roles could widen a role they are already bound to.
 
@@ -293,7 +293,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 
 ### How an access check is evaluated
 
-When a worker asks the control plane whether a user may perform an action on an asset, the control plane evaluates the request in a fixed order and denies by default.
+When a worker asks the authority whether a user may perform an action on an asset, the authority evaluates the request in a fixed order and denies by default.
 
 ```mermaid
 flowchart TB
@@ -323,7 +323,7 @@ Jumpgate supported richer globs, including a trailing `**` that matched a whole 
 
 ### Group membership from identity providers
 
-When a user signs in through an identity provider, the control plane reads the group claim configured on that IdentityProvider and records which externally referenced groups the user currently matches. These memberships are tracked separately from explicitly listed members. On each sign-in or token refresh, IdP-derived memberships are replaced with the current claim, and explicit memberships are left untouched.
+When a user signs in through an identity provider, the authority reads the group claim configured on that IdentityProvider and records which externally referenced groups the user currently matches. These memberships are tracked separately from explicitly listed members. On each sign-in or token refresh, IdP-derived memberships are replaced with the current claim, and explicit memberships are left untouched.
 
 A user who signs in with a local password has no IdP claims, so they belong only to groups that list them explicitly.
 
@@ -342,15 +342,15 @@ Organization-level resources have names unique within the organization for their
 
 ## Compatibility and upgrade
 
-Tidegate has no released version, so this TEP has no compatibility impact. The control plane API TEP defines how resource versions evolve.
+Tidegate has no released version, so this TEP has no compatibility impact. The authority API TEP defines how resource versions evolve.
 
 ## Test plan
 
-This TEP defines no code. The control plane implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, and tests that self-approval and approval through temporary bindings are rejected.
+This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, and tests that self-approval and approval through temporary bindings are rejected.
 
 ## Rollout
 
-The model is implemented together with the control plane. A likely order:
+The model is implemented together with the authority. A likely order:
 
 1. Users, local login, projects, assets, roles, and standing bindings.
 2. Groups, nesting, and shared groups.
