@@ -19,7 +19,7 @@ superseded-by: []
 
 This TEP defines the resources the Tidegate authority stores and the rules it uses to decide who may do what. It is a starting model agreed over several maintainer meetings, and later TEPs are expected to refine it.
 
-The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role uses label selectors and typed, protocol-specific permissions to describe access, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
+The organization is the top level of the model. For now a Tidegate instance serves exactly one organization, which stays implicit: it is not stored and does not appear in the API. The organization holds users, identity providers, and organization roles that govern administration, such as who manages users or creates and recovers projects. All access to infrastructure lives in projects. A project holds assets, groups, roles, bindings, and access policies. Assets carry labels, and a project role uses label selectors and typed, protocol-specific permissions to describe access, such as logging in over SSH as `root`. A binding gives a role to a user or group, either as standing access or for a limited time after an approved access request.
 
 The model borrows its shape from Kubernetes RBAC. An organization role works like a ClusterRole, a project works like a namespace, and a project role works like a Role.
 
@@ -88,7 +88,7 @@ erDiagram
 | Organization | Instance | Cluster | Top-level tenant. Implicit for now: one per instance, not stored and not exposed in the API. |
 | IdentityProvider | Organization | none | Configuration for an external identity provider, such as an OIDC issuer. |
 | User | Organization | User | A person or service account that can sign in. |
-| OrgRole | Organization | ClusterRole | A schema-validated set of governance permissions, such as managing users or creating projects. |
+| OrgRole | Organization | ClusterRole | Schema-validated organization and cross-project governance permissions. Never grants asset access. |
 | OrgBinding | Organization | ClusterRoleBinding | Gives an OrgRole to a user or a shared group. |
 | Project | Organization | Namespace | Boundary for assets and the access rules that apply to them. |
 | Group | Project | none | A set of users and other groups. Optionally shared with other projects, optionally mapped to an IdP group. |
@@ -116,9 +116,13 @@ Some users also need a local password. When the IdP is down or misconfigured, ad
 
 ### Organization roles and bindings
 
-An OrgRole has a schema-validated spec that describes governance permissions: what a subject may administer at the organization level. Examples are managing users, configuring identity providers, creating and deleting projects, managing organization roles and bindings, and reading the audit log. The spec uses defined fields with defined behavior, rather than free-form capability strings.
+An OrgRole has a schema-validated spec that describes governance permissions. Organization-level permissions cover operations such as managing users, configuring identity providers, creating and listing projects, managing organization roles and bindings, and reading the audit log. Cross-project governance permissions may authorize specific administrative operations on project resources, such as editing groups or access policies.
+
+The initial model has no project selector on an OrgRole. A cross-project governance permission therefore applies to every project. Organizations that need administration limited to one project use a Role and Binding in that project. More granular OrgRole fields can be added when concrete user needs justify them.
 
 Organization roles never grant access to assets. A user who holds a superadmin OrgRole cannot open a session to any asset until a project binding gives them a project role. This keeps the administrators of Tidegate itself separate from the people who use it to reach infrastructure, and makes access to assets visible in exactly one place: project bindings.
+
+Project recovery is an explicit OrgRole governance permission. It allows its holder to recover a project whose administrators have left by atomically ensuring that the standard project-administrator Role exists and creating a Binding from that role to themselves. It cannot bind an arbitrary Role, and it does not itself authorize an asset session. Every recovery is a distinct audit event.
 
 An OrgBinding gives an OrgRole to a subject. The subject is a user or a shared group. Organization bindings can carry an expiry time like project bindings, described under [Bindings](#bindings).
 
@@ -127,6 +131,8 @@ An OrgBinding gives an OrgRole to a subject. The subject is a user or a shared g
 A project is the boundary for assets and the rules that govern access to them. Each project holds its own assets, groups, roles, bindings, access policies, and access requests. A project role can select only assets in its own project, and a project binding grants roles only within its project.
 
 Projects let teams own their part of the asset inventory. A team that owns a project can label assets, define roles, and approve requests without organization-wide privileges and without affecting other projects.
+
+Creating a project also bootstraps its administration. In the same transaction, the authority creates a standard project-administrator Role and binds the user who created the project to it. That role contains the project-wide permissions needed to administer the project, including defining and binding roles, but contains no asset access rules. The creator may add other administrators and may remove their own binding, even when that leaves the project without an administrator; an organization administrator with the project-recovery permission can recover it later.
 
 ### Groups
 
@@ -256,6 +262,12 @@ spec:
   projects:
     creator: true
     reader: true
+    recoverer: true
+  projectResources:
+    groups:
+      editor: true
+    policies:
+      editor: true
 ---
 kind: Project
 name: system
@@ -292,6 +304,7 @@ In this example, members of the IdP group `admin` at the `github` provider becom
 ### User stories
 
 - A platform administrator bootstraps a new instance from a configuration file. Members of the company's `admin` IdP group can then sign in and administer the organization with no further setup.
+- An organization administrator creates the `payments` project. The authority creates its standard project-administrator Role and binds the creator to it in the same transaction. The creator can then add the team's administrators and remove their own binding.
 - The payments team owns the `payments` project. A team lead labels the production hosts `env: prod`, defines a role `prod-root` with an asset rule that matches `env: prod` and permits SSH login as `root`, and an access policy that lets the `payments-devs` group request it for up to two hours with one approval from the `payments-leads` group.
 - A developer in `payments-devs` requests `prod-root` for 30 minutes to investigate an incident. A lead approves, the developer gets a binding that expires in 30 minutes, and their SSH session ends when it expires.
 - The security team defines a shared group `security-oncall` in its own project. Other projects reference it as an approver group in their access policies, and the security team updates its membership in one place.
@@ -332,6 +345,8 @@ The model has no deny rules. Access is the union of what all applicable bindings
 
 Checks for administrative actions follow the same subject and binding resolution, then evaluate the relevant typed project-wide or organization-governance field. Asset selectors do not participate in administrative checks.
 
+Cross-project governance through an OrgRole follows the same rule but resolves OrgBindings rather than project Bindings. The project-recovery operation is narrower than general role binding: it can only restore and bind the standard project-administrator Role.
+
 ### Permission matching and validation
 
 The authority validates Role and OrgRole specs against the schema for their resource and API version when they are written. Unknown permission fields, unknown protocol sections, invalid values, and invalid field combinations are rejected rather than ignored.
@@ -351,9 +366,9 @@ Organization-level resources have names unique within the organization for their
 ## Security considerations
 
 - Trust boundaries. Identity providers are trusted to authenticate users and to assert group claims, but only for the groups that Tidegate explicitly maps, and only for the provider each mapping names. Using an IdP for sign-in already places it inside the trust boundary, because an IdP administrator who can sign in as a user holds that user's access in Tidegate. Multi-factor authentication with a factor only the user holds, such as a hardware key, prevents this kind of impersonation. It does not prevent an IdP administrator from adding their own account to a mapped IdP group and so granting themselves access. Group mapping is opt-in per group for this reason. Projects form an administrative boundary: a project's administrators can affect other projects only through groups they share.
-- Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. It does allow changing the IdP configuration or group mappings, which can lead to access indirectly, so organization roles must be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting permissions they are not entitled to delegate.
+- Privilege. Access to assets comes only from project bindings. Organization roles cannot reach assets, so compromising an organization administrator does not grant sessions directly. Organization governance can still lead to access indirectly: depending on the OrgRole spec, an administrator may change IdP configuration or group mappings, administer project resources, or invoke project recovery and then delegate project roles. Organization roles must therefore be guarded at least as closely as the most sensitive project. Temporary bindings expire, and the escalation check prevents users from granting permissions they are not entitled to delegate outside these explicit governance paths.
 - Credentials and secrets. This model stores local password hashes for break-glass users and IdP client secrets. Both are stored encrypted or hashed and never returned through the API. Bootstrap configuration must not contain plaintext passwords; how the first break-glass password is delivered is an open question.
-- Audit. Every create, update, and delete of a resource in this model is audited, along with access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, matching asset rule, and typed permission that allowed it.
+- Audit. Every create, update, and delete of a resource in this model is audited, along with project recovery, access requests, approvals, denials, revocations, binding expiry, IdP-derived membership changes, and local logins. The audit record of an access decision names the binding, role, matching asset rule, and typed permission that allowed it.
 - Failure behavior. Unknown spec fields, unresolvable references, and roles that fail validation are rejected when they are written. At evaluation time, a binding whose role or subject cannot be resolved grants nothing. If the IdP is unavailable, IdP users cannot sign in, and break-glass accounts are the fallback.
 - Threat model. In scope are a malicious requester, a compromised approver, a malicious project administrator, and a compromised IdP account. Self-approval is impossible, temporary access cannot be used to approve other requests, a project administrator cannot grant permissions beyond those they may delegate or affect projects that do not reference their shared groups, and IdP claims only affect explicitly mapped groups. A compromised identity provider can assert any mapped group and is out of scope for mitigation in this model. Organizations that need protection against it can require approvals from users who sign in with a separate factor, which a later TEP can address.
 
@@ -363,7 +378,7 @@ Tidegate has no released version, so this TEP has no compatibility impact. The a
 
 ## Test plan
 
-This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, and tests that self-approval and approval through temporary bindings are rejected.
+This TEP defines no code. The authority implementation is expected to include table-driven tests for access evaluation, negative authorization tests for every escalation rule in this TEP, tests that project creation atomically establishes its initial administrator, tests that project recovery can bind only the standard administrator role, and tests that self-approval and approval through temporary bindings are rejected.
 
 ## Rollout
 
@@ -378,6 +393,7 @@ The model is implemented together with the authority. A likely order:
 ## Drawbacks
 
 - Two levels of roles and bindings mean two places to look when answering "who can do what". The split is deliberate, but tooling has to show both.
+- Cross-project governance permissions are broad because the initial OrgRole model has no project selector. Sensitive permissions, especially project recovery, require careful assignment and prominent auditing.
 - Labels are flat. Organizations used to a folder hierarchy, as in jumpgate, have to express their structure through label conventions.
 - Shared groups create dependencies between projects that are not visible from the referencing side without tooling.
 - Without deny rules, removing access for one asset from a broad role means narrowing the role's selector or splitting the role.
@@ -399,8 +415,6 @@ Deny rules would allow carving exceptions out of broad roles. They make the resu
 - What should the "shared" flag be called? Meetings used both "shared" and "exported", and an early bootstrap draft used `extern`. This TEP uses `shared`.
 - Can org bindings be requested through access policies, so that organization administration is also just-in-time? This TEP allows org bindings with an expiry time but defines access policies only for project roles.
 - Do local-login accounts require a second factor, such as TOTP or WebAuthn, and how is the first password delivered without putting it in the bootstrap file?
-- Does creating a project automatically bind its creator to a project administrator role, and should Tidegate ship built-in project roles?
-- Can organization administrators recover a project whose administrators have all left, and if so, through which typed governance permission?
 - Should an asset access rule be able to delegate management of the assets it selects, for example letting a team edit only assets labeled with its own team name? Project-wide permissions are deliberately not narrowed by asset selectors.
 - Should access requests be able to ask for less than a whole role, for example one asset of the role's selection, as jumpgate grants were bound to a single asset?
 - How does the declarative format handle re-applying a bootstrap file to a running instance: create missing resources only, or reconcile and delete?
