@@ -21,7 +21,7 @@ The authority stores its data in Postgres. This TEP defines how the authority's 
 
 For each table there are two Go structs. One is generated from the table by a tool and uses the database driver's types, and this TEP calls it the database model. The other uses plain Go types, and this TEP calls it the code model. The logic only ever sees the code model.
 
-A method that changes data doesn't run its own SQL. It puts each write on a list, which this TEP calls a unit of work, and then calls `Commit`, which opens a transaction, runs the SQL for every write on the list and commits. Every `UPDATE` and `DELETE` in that transaction checks that the row is still at the version the method read. If it isn't, `Commit` returns an error, the API answers with the status code `aborted`, and the client reads the data again before it sends the change again.
+A method that changes data doesn't run its own SQL. It puts each write on a list, which this TEP calls a unit of work (uow), and then calls `Commit`, which opens a transaction, runs the SQL for every write on the list and commits. Every `UPDATE` and `DELETE` in that transaction checks that the row is still at the version the method read. If it isn't, `Commit` returns an error, the API answers with the status code `aborted`, and the client reads the data again before it sends the change again.
 
 Queries that don't return one table's rows, like a list with a join, return a struct shaped like the query result, which this TEP calls a read model.
 
