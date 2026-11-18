@@ -222,7 +222,7 @@ The authority accepts no caller of the type `authority`. Joining is the one call
 
 Every component holds a list of the CA certificates that it verifies other components against. A CA certificate is the public part of a CA. It holds no secret.
 
-When the authority hands out the certificates, the list lives in the authority, and only three things change it:
+When the authority hands out the certificates, the authority keeps the list, and only three things change it:
 
 - The authority creates a CA of its own at its first start, or exchanges it when an administrator replaces the CA.
 - With OpenBao, the authority reads the first CA certificate from a file that its settings name, when it starts for the first time.
