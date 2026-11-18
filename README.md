@@ -51,6 +51,7 @@ Run `scripts/validate-teps.py` locally before pushing. CI runs the same checks.
 | [0002](teps/0002-architecture/README.md) | Architecture vision | draft | @trevex |
 | [0004](teps/0004-scope-and-assumptions/README.md) | Scope, assumptions and operator responsibilities | draft | @The127 |
 | [0006](teps/0006-authority-storage/README.md) | How the authority stores and changes data | draft | @The127 |
+| [0007](teps/0007-workload-identity/README.md) | Workload identity for the internal mesh | draft | @The127 |
 <!-- END TEP INDEX -->
 
 ## Contributing
