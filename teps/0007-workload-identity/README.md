@@ -145,10 +145,10 @@ With SPIRE, more people can create a Tidegate component. Everyone who can regist
 
 ### Risks and mitigations
 
-- A signer that is set up too openly lets someone other than the authority get a certificate with one of this installation's IDs. This TEP states the conditions for each signer, the authority checks every certificate that a signer returns, and it refuses an ID that it didn't hand out.
+- A signer that is set up too openly lets someone other than the authority get a certificate with one of this installation's IDs. This TEP states the conditions for each signer, the authority checks every certificate that a signer returns, and on its own API it only accepts the certificates that it handed out.
 - A join token leaks before it's used. It works once and expires after an hour by default. If someone else uses it first, the real component fails to join, and the authority records the second attempt as an event of its own.
-- Someone copies a component's key. The authority only renews the latest certificate of a component, so the copy and the real component can't both keep renewing. The one that comes second is refused, and the authority records that.
-- The authority or the signer is down for longer than a certificate lives. Components can't renew, and the mesh stops. Components renew at half of the lifetime, and the operator can choose a longer lifetime.
+- Someone copies a component's key. The authority only renews the latest certificate of a component, so the copy and the real component can't both keep renewing. When the second one tries, the authority removes the component, and both stop.
+- The authority or the signer is down for longer than a certificate lives. Components can't renew, and the mesh stops. Components renew at half of the lifetime, and the operator can choose longer lifetimes.
 - With SPIRE, the group of people who can create a component is as large as the group that can register workloads in the trust domain. An operator for whom that group is too large runs a trust domain for Tidegate alone.
 
 ## Design details
@@ -159,11 +159,11 @@ A component's certificate:
 
 - has exactly one name, the URI with the component's ID, and no DNS names or IP addresses
 - isn't a CA certificate and can't sign other certificates
-- is valid for client authentication and for server authentication
+- is valid for client authentication and for server authentication, and its key can only make signatures
 
 Certificates from the authority use ECDSA keys on the P-256 curve. Peers ignore the certificate's subject.
 
-SPIRE's certificates meet these rules.
+SPIRE's certificates meet these rules as long as a registration sets no DNS names.
 
 ### The ID
 
@@ -204,7 +204,7 @@ A peer accepts a certificate only if all of this holds:
 
 These checks take the place of the host name check that TLS libraries do by default. A component never turns that check off without them. They apply to every connection, also to one that resumes an earlier TLS session.
 
-A component closes a connection in the mesh when the other side's certificate expires, at the latest.
+A component closes a connection in the mesh when the other side's certificate expires, at the latest. A session through a session-gateway and a worker therefore ends with the certificates that its connection started with. With the default lifetime, that's after 12 to 24 hours.
 
 Each connection in TEP-0005 expects these types:
 
@@ -212,20 +212,25 @@ Each connection in TEP-0005 expects these types:
 |---|---|---|
 | A gateway or a worker to the authority | `authority`, any instance | `session-gateway`, `ssh-gateway` or `ssh-worker`. The method decides which |
 | The session-gateway to a worker | `ssh-worker`, the instance that the authority listed | `session-gateway` |
-| The ssh-gateway to the session-gateway | `session-gateway` | `ssh-gateway`, the instance that the ticket names |
+| The ssh-gateway to the session-gateway | `session-gateway` | `ssh-gateway`. The request then has to come from the instance that the ticket names |
 
-The authority accepts no caller of the type `authority`.
+The authority accepts no caller of the type `authority`. Joining is the one call without a certificate, and renewal accepts each of the three other types.
 
 ### Trusted CA certificates
 
 Every component holds a list of the CA certificates that it verifies other components against. A CA certificate is the public part of a CA. It holds no secret.
 
-When the authority hands out the certificates, the list lives in the authority, and only two things change it:
+When the authority hands out the certificates, the list lives in the authority, and only three things change it:
 
-- The authority creates a CA of its own, at its first start or when an administrator replaces the CA.
-- An administrator adds or removes the public certificate of a CA, for example OpenBao's. That needs a permission of its own, and the authority records it in the audit log.
+- The authority creates a CA of its own at its first start, or exchanges it when an administrator replaces the CA.
+- With OpenBao, the authority reads the first CA certificate from a file that its settings name, when it starts for the first time.
+- An administrator adds or removes the public certificate of a CA. That needs a permission of its own.
 
-A component gets the list when it joins and again at every renewal. The authority never adds a CA certificate because a signer returned it.
+The authority records every change in the audit log. It never adds a CA certificate because a signer returned it.
+
+When a CA certificate leaves the list, every unused join token that carries its fingerprint becomes invalid.
+
+A component gets the list when it joins and again at every renewal. A component whose own certificate has expired accepts no connection and discards its list. It trusts nothing until it has joined again.
 
 With SPIRE, every component gets the list from the SPIRE agent, together with its own certificate.
 
@@ -233,11 +238,11 @@ With SPIRE, every component gets the list from the SPIRE agent, together with it
 
 The authority keeps a record of every component: its ID, how it got its certificate, when its token was created, when it joined, when it last renewed, which certificate it got last, and whether an administrator removed it. TEP-0003 has the authority record every change to a resource in the audit log, and that covers these records.
 
-When the authority hands out the certificates, it refuses a caller on its internal API whose ID has no record, or whose record says it was removed. A certificate that someone got from the signer directly is refused that way.
+When the authority hands out the certificates, a caller on its internal API has to show the certificate that its record names, or the one before it while that one is valid. The authority refuses every other certificate, also one with the ID of a component that exists, and it refuses a removed component. A certificate that someone got from the signer directly is refused that way.
 
 With SPIRE, the authority creates the record when it first sees an ID, and refuses a removed component.
 
-The authority refuses a second open stream of TEP-0005 for an ID that already has one, and records it. Two components that share one ID would otherwise receive each other's sessions.
+Each ID belongs to one running component. This TEP doesn't define how the authority notices two running components with one ID.
 
 ### Joining through the authority
 
@@ -257,19 +262,19 @@ A token:
 
 The authority stores only a digest of the secret part. TEP-0005 stores login tokens the same way.
 
-Creating a join token needs an organization permission of its own, in the sense of TEP-0003, because a token creates a component that can receive credentials for targets.
+Creating a join token needs an organization permission of its own, in the sense of TEP-0003, because a token creates a component that can receive credentials for targets or ask for sessions.
 
 #### The join call
 
 The component reads the token from a file. It takes its own ID and the ID prefix from the token and creates a key pair.
 
-Then it connects to the authority. During the TLS handshake it checks the authority's certificate as described under "Accepting a certificate", with one difference: its list of trusted CA certificates isn't there yet. It uses the token's fingerprints instead. The authority's certificate has to lead to a CA certificate whose public key matches one of them, and the component verifies every signature on that path. It expects the type `authority` under the token's ID prefix.
+Then it connects to the authority. During the TLS handshake it checks the authority's certificate as described under "Accepting a certificate", with one difference: its list of trusted CA certificates isn't there yet. It uses the token's fingerprints instead. The authority's certificate has to lead to a CA certificate whose public key matches one of them, and the component verifies every signature on that path. The authority sends the whole path in the handshake, the CA certificate included. The component expects the type `authority` under the token's ID prefix.
 
 Only then the component sends two things: the token's secret part, and a certificate signing request for exactly its ID. The request proves that the component holds the private key. A token that someone puts on a component with the wrong address is never sent.
 
 The authority then does this in order:
 
-1. In one step in Postgres, it marks the token as used if the token exists, is unused and hasn't expired. If two requests arrive with the same token, only one of them gets past this step. From here on, a failure costs the token, and the administrator creates a new one.
+1. In one step in Postgres, it marks the token as used if the token exists, is unused, hasn't expired and its component wasn't removed. If two requests arrive with the same token, only one of them gets past this step. From here on, a failure costs the token, and the administrator creates a new one.
 2. It checks that the request asks for the token's ID and for no other name.
 3. It has the signer sign the certificate and checks what the signer returns.
 4. It notes the certificate in the component's record.
@@ -291,28 +296,30 @@ This section is about certificates from the authority. "How SPIRE is used" says 
 
 #### Lifetime and renewal
 
-A certificate is valid for 24 hours by default. The operator can set another lifetime on the authority.
+A certificate is valid for 24 hours by default. The operator can set another lifetime on the authority, seven days at most.
 
-A component renews its certificate when half of the lifetime has passed. It creates a new key pair and calls the renewal method of the internal API with its current certificate. The authority:
+A component renews its certificate when half of the lifetime has passed. It creates a new key pair and stores the new key in its directory, next to the old one. Then it calls the renewal method of the internal API with its current certificate and sends a certificate signing request for its ID, which proves that it holds the new key. The authority:
 
 1. checks that the component has a record and wasn't removed
 2. checks that the certificate the caller shows is the last one it gave this component
-3. has the signer sign a new certificate for the same ID
-4. notes the new certificate in the record and returns it with the list of trusted CA certificates
+3. checks that the request asks for the component's ID and for no other name
+4. has the signer sign the new certificate and checks what the signer returns
+5. notes the new certificate in the record and returns it with the list of trusted CA certificates
 
-If the answer gets lost, the component asks again with the same request and gets the same certificate.
+The component deletes the old key when it holds the new certificate. If the answer gets lost or the component restarts, it asks again with the same request and gets the same certificate.
 
-A renewal with an older certificate and another key is refused and recorded. That's the sign of a copied key: two holders of one identity can't both renew. The administrator removes the component, and the real one joins again. A component that was restored from a backup is in the same position.
+A renewal with an older certificate and another key is the sign of a copied key: two holders of one identity can't both renew. The authority refuses it, removes the component by itself and records why. Both holders stop, and the real component needs a new token. A component that was restored from a backup triggers the same.
 
 If a renewal fails for another reason, the component tries again until its certificate expires. After that it can't renew and needs a new token. A server that was switched off for longer than a certificate lives is in the same position.
 
-The lifetime is a trade-off. A shorter one limits how long a removed component's certificate still works between other components. A longer one lets the mesh survive a longer outage of the authority or the signer.
+The lifetime is a trade-off. A shorter one limits how long a removed component's certificate still works between other components, and it shortens sessions. A longer one lets the mesh survive a longer outage of the authority.
 
 #### Removing a component
 
 An administrator removes a component with the CLI. That needs a permission of its own. The authority then:
 
 - refuses the component's calls and doesn't renew its certificate
+- makes its join token invalid if the component hasn't joined yet
 - closes its open streams
 - ends its sessions and takes it off the list of workers, in the terms of TEP-0005
 
@@ -339,7 +346,13 @@ With OpenBao, the operator does the same by hand:
 
 A join token only works while the authority's own certificate leads to a CA that the token has a fingerprint for. A token from before a replacement can stop working during it. It fails without giving anything away, and the administrator creates a new one.
 
-If a CA key is stolen, there's no gradual way. The administrator removes that CA from the list. The authority then refuses every certificate from it and makes every unused join token invalid, because those tokens carry its fingerprint. Every component needs a new token. Until a component has joined again, it still trusts the stolen CA.
+If a CA key is stolen, there's no gradual way. The administrator replaces the CA in one action:
+
+1. A new CA comes onto the list. The authority creates one, or the administrator adds the public certificate of a new CA in OpenBao.
+2. Every authority replica takes a new certificate from the new CA.
+3. The stolen CA leaves the list.
+
+From then on, the authority refuses every certificate from the stolen CA, and every gateway and worker needs a new token. A gateway or a worker that still runs trusts the stolen CA until its own certificate has expired. That's one more reason for the upper limit on the lifetime.
 
 ### The signer
 
@@ -378,13 +391,13 @@ The operator sets it up like this:
 - A PKI in OpenBao that is used for this Tidegate installation and nothing else.
 - A role in it that only allows URI names under the installation's ID prefix, no other names, no CA certificates, and no lifetime above the one set on the authority.
 - Access for the authority that allows signing a request with that role and nothing else. It doesn't allow signing without a role, creating keys or signing CA certificates.
-- The public certificate of that CA on the authority's list.
+- The public certificate of that CA in a file that the authority's settings name. The authority reads it at its first start. Later changes to the list go through an administrator.
 
 ### How SPIRE is used
 
 Every component gets its certificate from the SPIRE agent on its host, through the SPIFFE Workload API. That API is a local socket. The component keeps the connection open, and SPIRE sends a new certificate and new CA certificates before the old ones expire. The component's private key comes from the agent too.
 
-If the agent offers a component several identities, the component uses the one under its ID prefix. If none or more than one is under the prefix, it doesn't start.
+If the agent offers a component several identities, the component uses the one under its ID prefix that has its own type. If none or more than one fits, it doesn't start.
 
 In such an installation:
 
@@ -414,7 +427,11 @@ With the CA that the authority keeps, the first replica that starts creates the 
 
 Then every replica gets its own certificate. It creates a key pair in memory, chooses a random instance of at least 128 bits and asks the signer. It stores no key on disk, and a restarted replica starts with a new key.
 
-Other components can't see the authority's records, so nobody can remove an authority's certificate. It's therefore valid for one hour, whatever lifetime the operator set for the other components, and the replica renews it after half an hour. The authority reaches its signer directly and doesn't need more.
+Other components can't see the authority's records, so nobody can remove an authority's certificate. It's therefore valid for one hour by default, and the replica renews it at half of that time. This lifetime has a setting of its own, apart from the one for the other components. A replica never asks for more than the signer allows.
+
+With OpenBao, this lifetime decides how long OpenBao may be down. A replica without a valid certificate can't be reached, whatever is left on the other components' certificates. With the default, that's 30 minutes. A longer lifetime buys more time and lets a stolen authority key work longer.
+
+Connections to the authority end when its certificate expires, so gateways and workers open their streams to it again at least that often.
 
 With SPIRE, the authority gets its certificate from the SPIRE agent, like every other component.
 
@@ -427,7 +444,9 @@ The authority doesn't serve its internal API before it has a certificate. If it 
 | Where certificates come from | Every component | The authority |
 | The installation's name | The authority | None, required with certificates from the authority |
 | The signer and how to reach it | The authority | The CA that the authority keeps |
-| The lifetime of a certificate | The authority | 24 hours |
+| The lifetime of a certificate | The authority | 24 hours, seven days at most |
+| The lifetime of the authority's own certificate | The authority | One hour |
+| The file with the first CA certificate | The authority | None, required with OpenBao |
 | The authority's address | Gateways and workers | None, required |
 | The file with the join token | Gateways and workers | None, required to join |
 | The directory for the key and the certificate | Gateways and workers | A directory of the component |
@@ -445,7 +464,7 @@ On servers set up by hand, with the CA that the authority keeps:
 
 After that, nothing is left to do while the components run. A component that was off for longer than a certificate lives needs a new token.
 
-With OpenBao, two steps come first: set up the PKI, the role and the authority's access as described under "OpenBao", and add the CA's public certificate to the authority's list.
+With OpenBao, one step comes first: set up the PKI, the role and the authority's access as described under "OpenBao", and put the CA's public certificate into the file that the authority reads at its first start.
 
 In Kubernetes with SPIRE:
 
@@ -459,11 +478,11 @@ In Kubernetes without SPIRE, the steps are the ones for servers. Each gateway an
 ## Security considerations
 
 - Trust boundaries. When the authority hands out certificates, it decides alone who is a component. With OpenBao, the PKI there and everyone who can change it or sign with it can create a component too. With SPIRE, the decision moves to SPIRE: the SPIRE server, a CA above it, everyone who can register workloads in the trust domain and everyone who can start a workload that matches a registration can create a component of any type, the authority included. A SPIRE agent that is taken over can get the identities of all workloads registered for its host. These parts join the ones that [TEP-0004](../0004-scope-and-assumptions/README.md) names as trusted, and restricting them is the operator's responsibility.
-- Privilege. An identity of the type `ssh-worker` can receive credentials for targets, within the limits of TEP-0005. Creating a join token, removing a component, changing the list of trusted CA certificates and replacing the CA each need a permission of their own. A token is bound to one type and one instance, and never to the type `authority`. A component can't choose its type or its instance. An identity isn't limited to a part of the targets: every `ssh-worker` can offer itself for every session.
+- Privilege. An identity of the type `ssh-worker` can receive credentials for targets, and one of the type `ssh-gateway` can ask for a session as any user whose public key it knows, both within the limits of TEP-0005. Creating a join token, removing a component, changing the list of trusted CA certificates and replacing the CA each need a permission of their own. A token is bound to one type and one instance, and never to the type `authority`. A component can't choose its type or its instance. An identity isn't limited to a part of the targets: every `ssh-worker` can offer itself for every session.
 - Credentials and secrets. A join token is shown once, stored as a digest and never logged. With certificates from the authority, a component's private key is created on that component, stays there, is readable only by its user and is replaced at every renewal. With SPIRE, the SPIRE agent creates the key. The authority's own key exists only in memory. The key of the CA that the authority keeps is encrypted in Postgres, and whatever decrypts it is as powerful as the key. With OpenBao, the CA key isn't in Tidegate, but the authority's access to OpenBao can create any identity of the installation.
-- Audit. The authority records the creation and the use of a join token and every refused use of one that exists, every certificate that it had signed with its ID and lifetime, a renewal with an older certificate, a second stream for one ID, every removed component, every change to the list of trusted CA certificates and each step when the CA is replaced. With SPIRE, it records the first time it sees an ID.
+- Audit. The authority records the creation and the use of a join token and every refused use of one that exists, every certificate that it had signed with its ID and lifetime, a renewal with an older certificate, every removed component and whether an administrator or the authority removed it, every change to the list of trusted CA certificates and each step when the CA is replaced. With SPIRE, it records the first time it sees an ID.
 - Failure behavior. Every failure ends in a refusal. Without the signer, nobody joins or renews. Without the authority, nobody renews. Without the SPIRE agent, a component gets no new certificate. In each case the existing certificates work until they expire, and then the components refuse each other. An expired certificate is never accepted, and a connection doesn't outlive the certificate it was opened with.
-- Threat model. A network attacker meets mutual TLS on every connection. A joining component sends its token only to a server that proves an `authority` certificate of the right installation from a CA that the token names. A stolen join token has to be used before it expires. Whoever uses it first holds an identity that lasts until an administrator removes it, and the real component's failed join is the sign of it. A stolen component key works until the component is removed or until its real owner's next renewal exposes the copy. A removed component's certificate still works between a gateway and a worker until it expires. A stolen key of an authority replica works for up to an hour. A compromised gateway or worker can't create identities, because no component's certificate can sign another one. An administrator who may create join tokens can create a worker, which the audit log shows. A compromised authority, signer, CA or SPIRE server can create any identity. That remains an operator-level risk, as in TEP-0005.
+- Threat model. A network attacker meets mutual TLS on every connection. A joining component sends its token only to a server that proves an `authority` certificate of the right installation from a CA that the token names. A stolen join token has to be used before it expires. Whoever uses it first holds an identity that lasts until an administrator removes it, and the real component's failed join is the sign of it. A stolen component key works until the component is removed. The authority removes it by itself as soon as the copy and the real component have both tried to renew. A removed component's certificate still works between a gateway and a worker until it expires. A stolen key of an authority replica works for as long as the authority's own certificate lives, one hour by default. A compromised gateway or worker can't create identities, because no component's certificate can sign another one. An administrator who may create join tokens can create a worker, which the audit log shows. A compromised authority, signer, CA or SPIRE server can create any identity. That remains an operator-level risk, as in TEP-0005.
 
 Joining is the one method of the internal API that answers a caller without a certificate. It takes a request of limited size, does one lookup, gives every failure the same answer and limits how often one address may call it.
 
@@ -489,8 +508,8 @@ An installation can't change where its certificates come from, or its signer, wh
 - Unit tests for the ID: every rule with an ID that breaks it, like a trust domain that only starts with the right name, a third path segment, an unknown type, a port or a second URI name.
 - Unit tests for accepting a certificate: one that can sign other certificates, one from a CA that isn't on the list, an expired one, one with a DNS name, and a resumed TLS session after the list changed.
 - Integration tests for joining: a valid, a used, an expired and an unknown token, two joins with one token at the same moment, a request for another ID than the token's, a server whose certificate doesn't match the fingerprints, and a server of another installation with the same CA.
-- Integration tests for the internal API: every method except joining refuses a caller without a certificate, with a certificate from another CA, with an ID that has no record, and with a removed component's certificate. A removed component's open stream is closed.
-- Integration tests for renewal: a renewal with an older certificate is refused and recorded, and a repeated request returns the same certificate.
+- Integration tests for the internal API: every method except joining refuses a caller without a certificate, with a certificate from another CA, with an ID that has no record, with another certificate for an ID that exists, and with a removed component's certificate. A removed component's open stream is closed, and its unused token no longer works.
+- Integration tests for renewal: a renewal with an older certificate and another key removes the component, and a repeated request returns the same certificate, also after the component restarted.
 - Tests for what a signer returns: a certificate with another key, another ID, an extra name, a longer validity or the right to sign certificates is refused.
 - OpenBao and SPIRE run as real software in CI: an OpenBao server, and a SPIRE server with an agent.
 - A test that replaces the CA while components keep talking to each other.
@@ -512,7 +531,8 @@ Steps 1 and 2 are part of the first version in which components talk to each oth
 - Joining with a token takes a person or the operator's own automation, and a component that loses its key needs a new token. In Kubernetes that means persistent volumes or SPIRE.
 - When the authority hands out certificates, every component depends on it for renewal. An outage that lasts longer than a certificate stops the mesh.
 - With SPIRE, Tidegate trusts everyone who can register workloads there with the decision who is a worker.
-- A component that is restored from a backup can't renew and has to join again.
+- A component that is restored from a backup is removed at its next renewal and has to join again.
+- A session ends when the certificates of its connection expire, after 12 to 24 hours with the default lifetime.
 
 ## Alternatives
 
@@ -532,8 +552,9 @@ Steps 1 and 2 are part of the first version in which components talk to each oth
 
 - What encrypts the CA key in Postgres when the authority keeps the CA? The TOTP secrets, the SSH CAs and the key for admission tickets need the same answer. That may be a TEP of its own, and step 1 of the rollout waits for it.
 - What are the type names? TEP-0002 says web-gateway and ssh-proxy, TEP-0005 says session-gateway and SSH worker. The table of types uses TEP-0005's.
-- Are 24 hours for a certificate, one hour for a join token and one hour for the authority's own certificate the right defaults?
-- Should the authority remove a component by itself when it sees a renewal with an older certificate, so that both holders of the key stop at once?
+- Are 24 hours for a certificate, one hour for a join token and one hour for the authority's own certificate the right defaults, and seven days the right upper limit?
+- How does the authority notice two running components with one ID? TEP-0005 owns the streams where that would show.
+- Do TEP-0005's leases survive that gateways and workers open their streams to the authority again at least once an hour?
 - Should a worker refuse a removed session-gateway before its certificate expires? TEP-0005 would have to let the worker tell the authority which gateway carried a session.
 - Should a join token bind a worker to a part of the targets? TEP-0005 lets a worker say itself what it can reach.
 - How does an operator's automation sign in to create join tokens? TEP-0003 names service accounts as users, but no TEP says how one signs in.
