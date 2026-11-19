@@ -53,6 +53,7 @@ Run `scripts/validate-teps.py` locally before pushing. CI runs the same checks.
 | [0004](teps/0004-scope-and-assumptions/README.md) | Scope, assumptions and operator responsibilities | draft | @The127 |
 | [0005](teps/0005-gateway-sessions/README.md) | Gateway routing and session lifecycle | draft | @trevex |
 | [0006](teps/0006-authority-storage/README.md) | How the authority stores and changes data | draft | @The127 |
+| [0007](teps/0007-workload-identity/README.md) | Workload identity for the internal mesh | draft | @The127 |
 <!-- END TEP INDEX -->
 
 ## Contributing
