@@ -274,6 +274,8 @@ The authority keeps a ledger of live sessions and the grant or binding each one 
 
 ### Trust zones
 
+To adhere to the Principle of Least Privilege, TideGate is designed modular, requiring its individual modules to reside in distinct trust zones.
+
 ```mermaid
 flowchart LR
     subgraph user["User networks · untrusted"]
@@ -303,7 +305,15 @@ flowchart LR
     t -.->|"agents dial out"| wk
 ```
 
-Only the edge zone accepts connections from user networks. Workers, the database, and the recording store accept connections only from inside the core zone. Targets reached through agents accept no inbound connections from Tidegate at all.
+Clients reside in **untrusted zones**. Every request originating from an untrusted zone is treated as a potential attack.
+
+The **edge zone** accepts inbound connections from untrusted networks. Load balancer, authority endpoint and gateways MUST be located on this zone.
+
+Authority, including its data base, and workers MUST be isolated in **core zone**. Core zone MUST not be connected to untrusted zones, but MUST accept inbound connections exclusively from inside the **edge zone**.
+
+Targets reached through agents MUST accept no inbound connections from Tidegate at all. Agents reside in **target network** and initiate outbound connections to the PAM on its own.
+
+Its up to TideGate's operator to set trust zones accordingly.
 
 ### Future extensions
 
@@ -379,3 +389,4 @@ Supporting only the Tidegate CLI and browser, as jumpgate did, would avoid proto
 
 - 2026-10-01: First draft, based on the architecture agreed in a maintainers' meeting.
 - 2026-10-22: Renamed the control plane to the authority.
+- 2026-11-16: Made trust zone more explicitly
